@@ -1,0 +1,677 @@
+//@version=5
+strategy("Q4 Detector - Market Stress", overlay=true, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=100,
+         initial_capital=100000,
+         commission_type=strategy.commission.percent,
+         commission_value=0.01,
+         slippage=1)
+
+// ══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+// Core SMA Parameters
+// ─────────────────────────────────────────────
+spy_short_len       = input.int(40, "SPY Short SMA", minval=5, maxval=50, group="Core SMAs")
+ma_long_len         = input.int(400, "Long SMA", minval=100, maxval=650, group="Core SMAs")
+
+// ─────────────────────────────────────────────
+// Indicator Lookbacks
+// ─────────────────────────────────────────────
+oas_lookback        = input.int(252, "OAS Lookback", minval=60, group="Lookbacks")
+nfci_lookback       = input.int(252, "NFCI Lookback", minval=60, group="Lookbacks")
+
+// ─────────────────────────────────────────────
+// Warning Thresholds
+// ─────────────────────────────────────────────
+oas_warn_thresh     = input.float(1.5, "OAS Warning Z", step=0.1, group="Thresholds")
+oas_elevated_thresh = input.float(2.0, "OAS Elevated Z", step=0.1, group="Thresholds")
+oas_crisis_thresh   = input.float(2.5, "OAS Crisis Z", step=0.1, group="Thresholds")
+nfci_warn_thresh    = input.float(1.0, "NFCI Warning Z", step=0.1, group="Thresholds")
+nfci_crisis_thresh  = input.float(2.5, "NFCI Crisis Z", step=0.1, group="Thresholds")
+breadth_warn_thresh = input.float(50, "Breadth Warning %", step=5, group="Thresholds")
+breadth_crit_thresh = input.float(35, "Breadth Critical %", step=5, group="Thresholds")
+vix_warn_thresh     = input.float(1.0, "VIX Backwardation Threshold", step=0.05, group="Thresholds")
+vix_severe_thresh   = input.float(1.15, "VIX Severe Backwardation", step=0.05, group="Thresholds")
+
+// ─────────────────────────────────────────────
+// Warning Weights (sum to 100 for easy interpretation)
+// ─────────────────────────────────────────────
+weight_oas          = input.float(0, "Weight: OAS", step=5, group="Warning Weights", 
+                       tooltip="Credit stress - leading indicator")
+weight_nfci         = input.float(0.1, "Weight: NFCI", step=5, group="Warning Weights",
+                       tooltip="Financial conditions - leading indicator")
+weight_vix          = input.float(0.1, "Weight: VIX Term", step=5, group="Warning Weights",
+                       tooltip="Fear gauge - coincident indicator")
+weight_breadth      = input.float(0.1, "Weight: Breadth", step=5, group="Warning Weights",
+                       tooltip="Market internals - coincident indicator")
+weight_nhnl         = input.float(0, "Weight: NH-NL", step=5, group="Warning Weights",
+                       tooltip="New highs/lows - lagging confirmation")
+
+// ─────────────────────────────────────────────
+// Confirmation Requirements
+// ─────────────────────────────────────────────
+confirm_bars_down   = input.int(1, "Confirm Bars (Risk-Off)", minval=1, maxval=5, group="Confirmation",
+                       tooltip="Bars warning must persist before acting")
+confirm_bars_up     = input.int(3, "Confirm Bars (Risk-On)", minval=1, maxval=10, group="Confirmation",
+                       tooltip="Bars of clear conditions before ramping up")
+recovery_conditions = input.int(3, "Recovery Conditions Required", minval=1, maxval=5, group="Confirmation",
+                       tooltip="How many indicators must be clear before recovery")
+
+// ─────────────────────────────────────────────
+// Volatility Adjustment
+// ─────────────────────────────────────────────
+enable_vol_adjust   = input.bool(true, "Enable Volatility Scaling", group="Volatility")
+vol_lookback        = input.int(20, "ATR Lookback", minval=5, maxval=50, group="Volatility")
+vol_baseline        = input.int(100, "ATR Baseline Lookback", minval=50, maxval=252, group="Volatility")
+vol_scale_max       = input.float(2, "Max Vol Scale Factor", step=0.1, group="Volatility",
+                       tooltip="When vol is low, can scale up to this")
+vol_scale_min       = input.float(0.5, "Min Vol Scale Factor", step=0.1, group="Volatility",
+                       tooltip="When vol is high, scale down to this")
+
+// ─────────────────────────────────────────────
+// Drawdown Circuit Breaker
+// ─────────────────────────────────────────────
+enable_dd_breaker   = input.bool(false, "Enable Drawdown Breaker", group="Drawdown Protection")
+dd_lookback         = input.int(60, "Drawdown Lookback (bars)", minval=20, maxval=252, group="Drawdown Protection")
+dd_threshold_1      = input.float(10, "Drawdown Level 1 %", step=1, group="Drawdown Protection")
+dd_reduction_1      = input.float(25, "Reduction at Level 1 %", step=5, group="Drawdown Protection")
+dd_threshold_2      = input.float(15, "Drawdown Level 2 %", step=1, group="Drawdown Protection")
+dd_reduction_2      = input.float(50, "Reduction at Level 2 %", step=5, group="Drawdown Protection")
+dd_threshold_3      = input.float(20, "Drawdown Level 3 %", step=1, group="Drawdown Protection")
+dd_reduction_3      = input.float(75, "Reduction at Level 3 %", step=5, group="Drawdown Protection")
+
+// ─────────────────────────────────────────────
+// Ramp Configuration  
+// ─────────────────────────────────────────────
+base_ramp_rate      = input.float(2.0, "Base Ramp Rate %/bar", step=0.5, group="Ramping")
+ramp_accel_factor   = input.float(1.3, "Ramp Acceleration Factor", step=0.1, group="Ramping",
+                       tooltip="Multiplier when signal is strong")
+max_ramp_rate       = input.float(8.0, "Max Ramp Rate %/bar", step=1, group="Ramping")
+ramp_delay_bars     = input.int(5, "Ramp Delay After Flip", minval=0, maxval=20, group="Ramping")
+
+// ─────────────────────────────────────────────
+// Position Limits
+// ─────────────────────────────────────────────
+max_equity          = input.float(100, "Maximum Equity %", step=5, group="Position Limits")
+min_equity          = input.float(15, "Minimum Equity %", step=5, group="Position Limits")
+crisis_floor        = input.float(20, "Crisis Floor %", step=5, group="Position Limits")
+
+// ─────────────────────────────────────────────
+// Display
+// ─────────────────────────────────────────────
+show_components     = input.bool(true, "Show Component Scores", group="Display")
+show_dashboard      = input.bool(true, "Show Dashboard", group="Display")
+show_debug          = input.bool(false, "Show Debug Info", group="Display")
+
+// ─────────────────────────────────────────────
+// RSI Dip Re-entry (hidden settings)
+// ─────────────────────────────────────────────
+rsi_length          = 86
+rsi_smooth          = 12
+rsi_midline         = 50.0
+enable_rsi_reentry  = true
+
+// ══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════
+
+f_get(_sym, _expr) =>
+    request.security(_sym, timeframe.period, _expr)
+
+// Normalise a value to 0-1 range with soft clipping
+f_sigmoid(_val, _center, _scale) =>
+    1 / (1 + math.exp(-(_val - _center) / _scale))
+
+// Rate of change (momentum) of a series
+f_momentum(_src, _len) =>
+    (_src - _src[_len]) / math.max(_src[_len], 0.0001)
+
+// ══════════════════════════════════════════════════════════════════════════
+// PRICE DATA
+// ══════════════════════════════════════════════════════════════════════════
+
+spy_price = f_get("SPY", close)
+spy_high  = f_get("SPY", high)
+spy_low   = f_get("SPY", low)
+
+// ══════════════════════════════════════════════════════════════════════════
+// RSI DIP DETECTOR (silent)
+// ══════════════════════════════════════════════════════════════════════════
+
+rsi_upper = ta.highest(close, rsi_length)
+rsi_lower = ta.lowest(close, rsi_length)
+rsi_r = rsi_upper - rsi_lower
+rsi_d = close - close[1]
+rsi_diff = rsi_upper > rsi_upper[1] ? rsi_r : rsi_lower < rsi_lower[1] ? -rsi_r : rsi_d
+rsi_num = ta.rma(rsi_diff, rsi_length)
+rsi_den = ta.rma(math.abs(rsi_diff), rsi_length)
+arsi = rsi_num / rsi_den * 50 + 50
+rsi_signal = ta.ema(arsi, rsi_smooth)
+rsi_cross_up = ta.crossover(rsi_signal, rsi_midline)
+
+// ══════════════════════════════════════════════════════════════════════════
+// INSTITUTIONAL INDICATORS - CONTINUOUS SCORING
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+// OAS (Credit Stress) - Continuous 0-100 score
+// ─────────────────────────────────────────────
+oas_raw       = f_get("FRED:BAMLH0A0HYM2", close)
+oas_mean      = ta.sma(oas_raw, oas_lookback)
+oas_stdev     = ta.stdev(oas_raw, oas_lookback)
+oas_zscore    = (oas_raw - oas_mean) / math.max(oas_stdev, 0.0001)
+oas_momentum  = f_momentum(oas_zscore, 10)
+
+// Continuous score: 0 = safe, 100 = maximum stress
+oas_base_score = math.max(0, math.min(100, (nz(oas_zscore) / 3) * 100))
+oas_accel_bonus = math.max(0, nz(oas_momentum) * 50)  // Rising stress = worse
+oas_score = nz(math.min(100, oas_base_score + oas_accel_bonus), 0)
+
+oas_warning  = oas_zscore > oas_warn_thresh
+oas_elevated = oas_zscore > oas_elevated_thresh
+oas_crisis   = oas_zscore > oas_crisis_thresh
+
+// ─────────────────────────────────────────────
+// NFCI (Financial Conditions) - Continuous 0-100 score
+// ─────────────────────────────────────────────
+nfci_raw      = f_get("FRED:NFCIRISK", close)
+nfci_mean     = ta.sma(nfci_raw, nfci_lookback)
+nfci_stdev    = ta.stdev(nfci_raw, nfci_lookback)
+nfci_zscore   = (nfci_raw - nfci_mean) / math.max(nfci_stdev, 0.0001)
+nfci_momentum = f_momentum(nfci_zscore, 10)
+
+nfci_base_score = math.max(0, math.min(100, (nz(nfci_zscore) / 3) * 100))
+nfci_accel_bonus = math.max(0, nz(nfci_momentum) * 40)
+nfci_score = nz(math.min(100, nfci_base_score + nfci_accel_bonus), 0)
+
+nfci_warning = nfci_zscore > nfci_warn_thresh
+nfci_crisis  = nfci_zscore > nfci_crisis_thresh
+
+// ─────────────────────────────────────────────
+// VIX Term Structure - Continuous 0-100 score
+// ─────────────────────────────────────────────
+vix_spot      = f_get("VIX", close)
+vix_3m        = f_get("VIX3M", close)
+vix_term      = vix_spot / math.max(vix_3m, 0.01)
+vix_smooth    = ta.sma(vix_term, 3)
+
+// Score: 0 when in contango (<0.9), 100 when severely inverted (>1.2)
+vix_score = nz(math.max(0, math.min(100, (vix_smooth - 0.9) / 0.3 * 100)), 0)
+
+vix_warning = vix_smooth > vix_warn_thresh
+vix_severe  = vix_smooth > vix_severe_thresh
+
+// ─────────────────────────────────────────────
+// Market Breadth - Continuous 0-100 score
+// ─────────────────────────────────────────────
+breadth_raw    = f_get("S5TH", close)
+breadth_pct    = na(breadth_raw) ? 50.0 : breadth_raw
+breadth_smooth = ta.sma(breadth_pct, 5)
+
+// Score: 0 when breadth > 70%, 100 when breadth < 30%
+breadth_score = nz(math.max(0, math.min(100, (70 - breadth_smooth) / 40 * 100)), 0)
+
+breadth_warning  = breadth_smooth < breadth_warn_thresh
+breadth_critical = breadth_smooth < breadth_crit_thresh
+
+// ─────────────────────────────────────────────
+// New Highs - New Lows - Continuous 0-100 score  
+// ─────────────────────────────────────────────
+new_highs    = f_get("HIGN", close)
+new_lows     = f_get("LOWN", close)
+nh_nl        = new_highs - new_lows
+nh_nl_smooth = ta.sma(nh_nl, 20)
+nh_nl_norm   = ta.sma(nh_nl, 60)  // Longer-term baseline
+
+// Score based on deviation from baseline
+nhnl_deviation = nz(nh_nl_smooth) - nz(nh_nl_norm)
+nhnl_score = nz(math.max(0, math.min(100, 50 - nhnl_deviation / 5)), 25)  // Default to neutral
+
+nhnl_warning = nh_nl_smooth < 0
+
+// ══════════════════════════════════════════════════════════════════════════
+// COMPOSITE STRESS SCORE (Weighted)
+// ══════════════════════════════════════════════════════════════════════════
+
+total_weight = weight_oas + weight_nfci + weight_vix + weight_breadth + weight_nhnl
+
+stress_score = (oas_score * weight_oas + nfci_score * weight_nfci + vix_score * weight_vix + breadth_score * weight_breadth + nhnl_score * weight_nhnl) / math.max(total_weight, 1)
+
+// Smooth the stress score to reduce noise
+stress_smooth = nz(ta.sma(stress_score, 3), 0)
+
+// ══════════════════════════════════════════════════════════════════════════
+// REGIME DETECTION - CONTINUOUS
+// ══════════════════════════════════════════════════════════════════════════
+
+// Adaptive SMA lengths based on stress (guard against NaN on early bars)
+stress_smooth_safe = nz(stress_smooth, 0)
+stress_factor = stress_smooth_safe / 100
+adaptive_short = math.round(spy_short_len * (1 - stress_factor * 0.5))  // Shorten when stressed
+adaptive_short := math.max(adaptive_short, 5)
+
+spy_short_sma = nz(ta.sma(spy_price, int(adaptive_short)), spy_price)
+spy_long_sma  = nz(ta.sma(spy_price, ma_long_len), spy_price)
+
+// Continuous regime score: -100 (deep bear) to +100 (strong bull)
+sma_gap_pct = (spy_short_sma - spy_long_sma) / math.max(spy_long_sma, 0.0001) * 100
+regime_score = nz(math.max(-100, math.min(100, sma_gap_pct * 10)), 0)  // Scale for sensitivity
+
+// Binary for state tracking
+regime_bull = spy_short_sma > spy_long_sma
+
+// ══════════════════════════════════════════════════════════════════════════
+// CONFIRMATION LOGIC
+// ══════════════════════════════════════════════════════════════════════════
+
+// Count consecutive bars of high/low stress
+var int high_stress_bars = 0
+var int low_stress_bars  = 0
+
+if stress_smooth > 50
+    high_stress_bars += 1
+    low_stress_bars := 0
+else if stress_smooth < 30
+    low_stress_bars += 1
+    high_stress_bars := 0
+else
+    // Neutral zone - slow decay
+    high_stress_bars := math.max(0, high_stress_bars - 1)
+    low_stress_bars := math.max(0, low_stress_bars - 1)
+
+// Count how many indicators are clear (for recovery validation)
+clear_count = (oas_zscore < oas_warn_thresh ? 1 : 0) +
+              (nfci_zscore < nfci_warn_thresh ? 1 : 0) +
+              (vix_smooth < vix_warn_thresh ? 1 : 0) +
+              (breadth_smooth > breadth_warn_thresh ? 1 : 0) +
+              (nh_nl_smooth > 0 ? 1 : 0)
+
+recovery_confirmed = clear_count >= recovery_conditions and low_stress_bars >= confirm_bars_up
+
+// Stress confirmed
+stress_confirmed = high_stress_bars >= confirm_bars_down
+
+// ══════════════════════════════════════════════════════════════════════════
+// VOLATILITY ADJUSTMENT
+// ══════════════════════════════════════════════════════════════════════════
+
+spy_atr        = nz(ta.atr(vol_lookback), 1)
+spy_atr_baseline = nz(ta.sma(spy_atr, vol_baseline), spy_atr)
+vol_ratio      = spy_atr / math.max(spy_atr_baseline, 0.0001)
+
+// Inverse relationship: high vol = lower position, low vol = higher position
+vol_scale = enable_vol_adjust ? math.max(vol_scale_min, math.min(vol_scale_max, nz(1 / vol_ratio, 1))) : 1.0
+
+// ══════════════════════════════════════════════════════════════════════════
+// DRAWDOWN CIRCUIT BREAKER
+// ══════════════════════════════════════════════════════════════════════════
+
+spy_highest = nz(ta.highest(spy_price, dd_lookback), spy_price)
+current_dd  = nz((spy_highest - spy_price) / math.max(spy_highest, 0.0001) * 100, 0)
+
+var float dd_reduction = 0.0
+
+if enable_dd_breaker
+    if current_dd >= dd_threshold_3
+        dd_reduction := dd_reduction_3
+    else if current_dd >= dd_threshold_2
+        dd_reduction := dd_reduction_2
+    else if current_dd >= dd_threshold_1
+        dd_reduction := dd_reduction_1
+    else
+        // Gradually release the brake as we recover
+        dd_reduction := math.max(0, dd_reduction - 2)
+else
+    dd_reduction := 0
+
+// ══════════════════════════════════════════════════════════════════════════
+// CRISIS DETECTION
+// ══════════════════════════════════════════════════════════════════════════
+
+crisis_active = oas_crisis or nfci_crisis or (stress_smooth > 75 and stress_confirmed)
+
+var bool in_crisis = false
+var int crisis_bars = 0
+
+if crisis_active
+    in_crisis := true
+    crisis_bars += 1
+else if in_crisis
+    // Require sustained recovery to exit crisis
+    if recovery_confirmed and crisis_bars > 10
+        in_crisis := false
+        crisis_bars := 0
+    else
+        crisis_bars += 1
+
+// ══════════════════════════════════════════════════════════════════════════
+// TARGET EQUITY CALCULATION
+// ══════════════════════════════════════════════════════════════════════════
+
+var float target_equity = 100.0
+
+if in_crisis
+    target_equity := crisis_floor
+else
+    // Base equity from regime score (continuous)
+    // regime_score: -100 to +100 → equity: min_equity to max_equity
+    regime_normalized = (regime_score + 100) / 200  // 0 to 1
+    base_equity = min_equity + (regime_normalized * (max_equity - min_equity))
+    
+    // Reduce based on stress score
+    stress_reduction = stress_smooth * 0.5  // Up to 50% reduction at max stress
+    
+    // Apply volatility scaling
+    vol_adjusted = base_equity * vol_scale
+    
+    // Apply drawdown brake
+    dd_adjusted = vol_adjusted * (1 - dd_reduction / 100)
+    
+    // Apply stress reduction
+    target_equity := math.max(min_equity, dd_adjusted - stress_reduction)
+
+target_equity := math.max(min_equity, math.min(max_equity, target_equity))
+
+// ══════════════════════════════════════════════════════════════════════════
+// CONDITIONAL RAMPING
+// ══════════════════════════════════════════════════════════════════════════
+
+var float actual_equity = 100.0
+var int bars_since_want_up = 0
+
+wants_increase = target_equity > actual_equity
+wants_decrease = target_equity < actual_equity
+
+if wants_increase
+    bars_since_want_up += 1
+else
+    bars_since_want_up := 0
+
+// Calculate dynamic ramp rate based on signal strength
+signal_strength = math.abs(target_equity - actual_equity) / 100
+dynamic_ramp = base_ramp_rate * (1 + signal_strength * ramp_accel_factor)
+dynamic_ramp := math.min(dynamic_ramp, max_ramp_rate)
+
+if wants_decrease
+    // Drops: immediate (no ramping down)
+    actual_equity := target_equity
+    
+else if wants_increase
+    // Increases: require confirmation and ramp
+    if recovery_confirmed and bars_since_want_up > ramp_delay_bars
+        actual_equity := math.min(target_equity, actual_equity + dynamic_ramp)
+    // else: hold position
+
+actual_equity := math.max(min_equity, math.min(max_equity, actual_equity))
+
+// ══════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ══════════════════════════════════════════════════════════════════════════
+
+// Main output
+plot(actual_equity, "EQUITY %", color=color.lime, linewidth=4)
+plot(target_equity, "Target", color=color.new(color.orange, 40), linewidth=2, style=plot.style_stepline)
+
+// Component scores (optional)
+plot(show_components ? stress_smooth : na, "Stress Score", 
+     color=color.new(color.red, 50), linewidth=1)
+plot(show_components ? regime_score + 50 : na, "Regime Score (+50)", 
+     color=color.new(color.blue, 60), linewidth=1)
+
+// Volatility scale (optional debug)
+plot(show_debug ? vol_scale * 50 : na, "Vol Scale (×50)", 
+     color=color.new(color.purple, 60), linewidth=1)
+plot(show_debug ? dd_reduction : na, "DD Reduction %", 
+     color=color.new(color.maroon, 60), linewidth=1)
+
+// Reference lines
+hline(100, "100%", color=color.new(color.gray, 80))
+hline(75, "75%", color=color.new(color.gray, 90))
+hline(50, "50%", color=color.new(color.gray, 90))
+hline(25, "25%", color=color.new(color.gray, 90))
+hline(0, "0%", color=color.new(color.gray, 80))
+
+// Backgrounds
+bgcolor(in_crisis ? color.new(color.red, 85) : na, title="Crisis Mode")
+bgcolor(dd_reduction > 25 ? color.new(color.maroon, 90) : na, title="DD Brake Active")
+bgcolor(recovery_confirmed and wants_increase ? color.new(color.green, 93) : na, title="Ramping Up")
+
+// ══════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 22, border_width=1)
+
+if show_dashboard and barstate.islast
+    row = 0
+    
+    // Header
+    table.cell(dash, 0, row, "REGIME v2", 
+         bgcolor=color.new(color.teal, 20), text_color=color.white, text_size=size.large)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+    
+    // Main position
+    eq_col = actual_equity >= 75 ? color.green : (actual_equity >= 40 ? color.yellow : color.red)
+    table.cell(dash, 0, row, "EQUITY", text_color=color.white, text_size=size.normal)
+    table.cell(dash, 1, row, str.tostring(math.round(actual_equity)) + "%", 
+         bgcolor=color.new(eq_col, 30), text_color=color.white, text_size=size.large)
+    row += 1
+    
+    table.cell(dash, 0, row, "Target", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, row, str.tostring(math.round(target_equity)) + "%", 
+         text_color=color.gray, text_size=size.small)
+    row += 1
+    
+    // Separator
+    table.cell(dash, 0, row, "── Stress ──", text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+    
+    // Stress score
+    stress_col = stress_smooth > 60 ? color.red : (stress_smooth > 35 ? color.orange : color.green)
+    table.cell(dash, 0, row, "Composite", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, row, str.tostring(math.round(stress_smooth)) + "/100", 
+         bgcolor=color.new(stress_col, 60), text_color=color.white, text_size=size.small)
+    row += 1
+    
+    // Individual indicators
+    table.cell(dash, 0, row, "OAS", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(oas_score)) + 
+         (oas_crisis ? " 🚨" : (oas_elevated ? " ⚠" : "")), 
+         bgcolor=color.new(oas_crisis ? color.red : (oas_warning ? color.orange : color.green), 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    table.cell(dash, 0, row, "NFCI", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(nfci_score)) + 
+         (nfci_crisis ? " 🚨" : (nfci_warning ? " ⚠" : "")), 
+         bgcolor=color.new(nfci_crisis ? color.red : (nfci_warning ? color.orange : color.green), 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    table.cell(dash, 0, row, "VIX Term", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(vix_score)) + 
+         (vix_severe ? " 🚨" : (vix_warning ? " ⚠" : "")), 
+         bgcolor=color.new(vix_severe ? color.red : (vix_warning ? color.orange : color.green), 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    table.cell(dash, 0, row, "Breadth", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(breadth_score)) + 
+         (breadth_critical ? " 🚨" : (breadth_warning ? " ⚠" : "")), 
+         bgcolor=color.new(breadth_critical ? color.red : (breadth_warning ? color.orange : color.green), 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    table.cell(dash, 0, row, "NH-NL", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(nhnl_score)) + 
+         (nhnl_warning ? " ⚠" : ""), 
+         bgcolor=color.new(nhnl_warning ? color.orange : color.green, 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    // Separator
+    table.cell(dash, 0, row, "── Modifiers ──", text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+    
+    // Regime
+    table.cell(dash, 0, row, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, row, regime_bull ? "BULL" : "BEAR", 
+         bgcolor=color.new(regime_bull ? color.green : color.red, 50),
+         text_color=color.white, text_size=size.small)
+    row += 1
+    
+    // Vol scale
+    table.cell(dash, 0, row, "Vol Scale", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(vol_scale * 100) / 100) + "x", 
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    // DD Brake
+    if dd_reduction > 0
+        table.cell(dash, 0, row, "DD Brake", text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 1, row, "-" + str.tostring(math.round(dd_reduction)) + "%", 
+             bgcolor=color.new(color.maroon, 50), text_color=color.white, text_size=size.tiny)
+        row += 1
+    
+    // Drawdown
+    table.cell(dash, 0, row, "Drawdown", text_color=color.white, text_size=size.tiny)
+    dd_col = current_dd > 15 ? color.red : (current_dd > 8 ? color.orange : color.green)
+    table.cell(dash, 1, row, str.tostring(math.round(current_dd * 10) / 10) + "%", 
+         bgcolor=color.new(dd_col, 70), text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    // Separator
+    table.cell(dash, 0, row, "── State ──", text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+    
+    // Crisis status
+    state_txt = in_crisis ? "CRISIS" : (recovery_confirmed ? "RECOVERY OK" : "NORMAL")
+    state_col = in_crisis ? color.red : (recovery_confirmed ? color.blue : color.green)
+    table.cell(dash, 0, row, "Mode", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, row, state_txt, 
+         bgcolor=color.new(state_col, 50), text_color=color.white, text_size=size.small)
+    row += 1
+    
+    // Clear indicators count
+    table.cell(dash, 0, row, "Clear Signals", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(clear_count) + "/" + str.tostring(recovery_conditions) + " req", 
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+    
+    // Ramp status
+    if wants_increase
+        ramp_status = bars_since_want_up <= ramp_delay_bars ? 
+             "DELAY " + str.tostring(bars_since_want_up) + "/" + str.tostring(ramp_delay_bars) :
+             (recovery_confirmed ? "ACTIVE +" + str.tostring(math.round(dynamic_ramp * 10) / 10) + "%/bar" : "WAITING")
+        table.cell(dash, 0, row, "Ramp", text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 1, row, ramp_status, 
+             bgcolor=color.new(recovery_confirmed ? color.green : color.gray, 70),
+             text_color=color.white, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════
+// ALERTS (Legacy alertcondition - for manual setup)
+// ══════════════════════════════════════════════════════════════════════════
+
+alertcondition(in_crisis and not in_crisis[1], "Crisis Started", "CRISIS MODE ACTIVATED")
+alertcondition(not in_crisis and in_crisis[1], "Crisis Ended", "Crisis mode ended - recovery phase")
+alertcondition(dd_reduction > 25 and dd_reduction[1] <= 25, "DD Brake Engaged", "Drawdown circuit breaker engaged")
+alertcondition(actual_equity <= 25 and actual_equity[1] > 25, "Low Allocation", "Equity dropped below 25%")
+alertcondition(actual_equity >= 90 and actual_equity[1] < 90, "High Allocation", "Equity reached 90%+")
+alertcondition(stress_smooth > 60 and stress_smooth[1] <= 60, "High Stress", "Stress score exceeded 60")
+
+// ══════════════════════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+// ══════════════════════════════════════════════════════════════════════════
+
+entry_thresh = input.float(65, "Entry Threshold %", group="Strategy", tooltip="Buy when equity rises above this")
+exit_thresh  = input.float(35, "Exit Threshold %", group="Strategy", tooltip="Sell when equity falls to this")
+
+// State tracking
+var bool awaiting_reentry = false   // Macro has exited, waiting for re-entry
+var bool rsi_holding = false        // RSI entered, macro exit blocked until macro catches up
+
+// Macro has "caught up" when it would also want to be in a position
+macro_caught_up = actual_equity > entry_thresh
+
+// When macro catches up, RSI hands control back to macro
+if rsi_holding and macro_caught_up
+    rsi_holding := false
+
+// EXIT LOGIC
+if strategy.position_size > 0
+    if rsi_holding
+        // RSI is holding - macro exit is BLOCKED
+        // Only exit if RSI crosses back below midline (dip failed)
+        if ta.crossunder(rsi_signal, rsi_midline)
+            strategy.close_all("Exit - Risk Off")
+            rsi_holding := false
+            awaiting_reentry := true
+    else
+        // Normal macro exit
+        if actual_equity <= exit_thresh
+            strategy.close_all("Exit - Risk Off")
+            awaiting_reentry := true
+
+// ENTRY LOGIC
+if strategy.position_size == 0
+    if actual_equity > entry_thresh
+        // Macro entry
+        strategy.entry("Long", strategy.long)
+        awaiting_reentry := false
+        rsi_holding := false
+    else if enable_rsi_reentry and rsi_cross_up and awaiting_reentry
+        // RSI re-entry (only after macro exit)
+        strategy.entry("Long", strategy.long)
+        awaiting_reentry := false
+        rsi_holding := true  // Block macro exit until it catches up
+
+// ══════════════════════════════════════════════════════════════════════════
+// WEBHOOK ALERTS (FINAL: Unified Signal)
+// ══════════════════════════════════════════════════════════════════════════
+// Webhook endpoint: https://alpha-edge-backend.fly.dev/api/webhook/regime
+// When creating alert in TradingView: select "Any alert() function call"
+// Set webhook URL, leave message field empty (JSON is in the alert() calls)
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── TICKER STRING FOR ALERTS ──
+tickerStr = syminfo.prefix + ":" + syminfo.ticker
+
+// ── MEMORY VARIABLES ──
+// This permanently remembers the last signal sent to your backend
+var string last_sent_signal = "NONE"
+
+// ── DAILY RECONCILIATION HEARTBEAT (MASTER INDEX ONLY) ──
+// Only fire this daily health check if the script is running on your core macro ticker
+is_master_ticker = syminfo.ticker == "SPY" or syminfo.ticker == "SPX" 
+is_new_day = ta.change(time("D")) != 0
+
+if is_master_ticker and barstate.isrealtime and is_new_day
+    string current_state = actual_equity > entry_thresh ? "BUY" : "SELL"
+    // Send a silent heartbeat to the backend strictly for the master ticker
+    alert('{"ticker": "' + tickerStr + '", "signal": "heartbeat", "current_zone": "' + current_state + '", "script": "q4d"}', alert.freq_once_per_bar_close)
+
+// ── ONGOING STATE CHANGES ──
+// Exactly mirroring your strategy's entry and exit conditions
+
+// Condition to BUY
+bool trigger_buy = (strategy.position_size == 0) and ((actual_equity > entry_thresh) or (enable_rsi_reentry and rsi_cross_up and awaiting_reentry))
+
+// Condition to SELL
+bool trigger_sell = (strategy.position_size > 0) and ((rsi_holding and ta.crossunder(rsi_signal, rsi_midline)) or (not rsi_holding and actual_equity <= exit_thresh))
+
+// Fire BUY only if we aren't already in a BUY state
+if trigger_buy and last_sent_signal != "BUY"
+    alert('{"ticker": "' + tickerStr + '", "signal": "BUY", "script": "q4d"}', alert.freq_once_per_bar_close)
+    last_sent_signal := "BUY"
+
+// Fire SELL only if we aren't already in a SELL state
+if trigger_sell and last_sent_signal != "SELL"
+    alert('{"ticker": "' + tickerStr + '", "signal": "SELL", "script": "q4d"}', alert.freq_once_per_bar_close)
+    last_sent_signal := "SELL"

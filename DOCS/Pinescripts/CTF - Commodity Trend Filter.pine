@@ -1,0 +1,407 @@
+//@version=5
+strategy("CTF — Commodity Trend Filter", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MODE SELECTION
+// ══════════════════════════════════════════════════════════════════════════════
+i_useOMSMode = input.bool(false, "Use OMS Multi-Indicator Mode", group="Mode Selection", tooltip="OFF = Simple SMA mode\nON = OMS 8-indicator weighted score")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIMPLE SMA MODE INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+i_smaLength     = input.int(205, "Main Trend SMA", minval=100, maxval=500, group="SMA Mode")
+i_filterLength  = input.int(24, "Whipsaw Filter SMA", minval=20, maxval=100, group="SMA Mode")
+i_minBarsAbove  = input.int(22, "Minimum bars above SMA before entry", minval=1, maxval=100, group="SMA Mode")
+i_minBarsBelow  = input.int(18, "Minimum bars below SMA before exit",  minval=1, maxval=100, group="SMA Mode")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OMS MODE INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── INDICATOR WEIGHTS ──
+i_weightSMA = input.float(3.0, "Weight: SMA Strategy", step=0.1, group="OMS Weights")
+i_weightOCC = input.float(2.0, "Weight: OCC", step=0.1, group="OMS Weights")
+i_weightSupertrend = input.float(2.0, "Weight: Adaptive SuperTrend", step=0.1, group="OMS Weights")
+i_weightRangeDaily = input.float(2.0, "Weight: Range Filter Daily", step=0.1, group="OMS Weights")
+i_weightRangeWeekly = input.float(4.0, "Weight: Range Filter Weekly", step=0.1, group="OMS Weights")
+i_weightShinohara = input.float(2.0, "Weight: Shinohara Intensity Ratio", step=0.1, group="OMS Weights")
+i_weightOscDaily = input.float(0.0, "Weight: Oscillator Daily", step=0.1, group="OMS Weights")
+i_weightOscWeekly = input.float(1.0, "Weight: Oscillator Weekly", step=0.1, group="OMS Weights")
+
+// ── MOMENTUM SETTINGS ──
+i_momentumThreshold = input.float(12.0, "Momentum Threshold for Buy/Sell", step=0.1, group="OMS Momentum")
+i_slopeLookback = input.int(3, "Momentum Slope Lookback (Days)", minval=1, group="OMS Momentum")
+i_weightSlope = input.float(0.5, "Weight: Momentum Slope", step=0.1, group="OMS Momentum")
+
+// ── SIGNAL FILTERS ──
+i_useSMAConfirm = input.bool(true, "Use SMA Confirmation for Signals", group="OMS Filters")
+i_useVolBoost = input.bool(true, "Boost Contributions by Volatility", group="OMS Filters")
+
+// ── Z-SCORE SETTINGS ──
+i_zLookback = input.int(10, "Z-Score Lookback", minval=1, group="OMS Z-Score")
+i_baseZThreshold = input.float(1.2, "Base Z Threshold", step=0.1, group="OMS Z-Score")
+i_adxThreshold = input.float(20.0, "ADX Threshold", step=0.1, group="OMS Z-Score")
+
+// ── SUPERTREND SETTINGS ──
+i_dailyATR_len = input.int(3, "ST: Daily ATR Length", group="OMS SuperTrend")
+i_dailyFactor = input.float(3.5, "ST: Daily SuperTrend Factor", group="OMS SuperTrend")
+
+// ── SMA STRATEGY (OMS) ──
+i_oms_sma_short = input.int(5, "SMA: Short Period", minval=1, group="OMS SMA")
+i_oms_sma_medium = input.int(82, "SMA: Medium Period", minval=1, group="OMS SMA")
+i_oms_sma_long = input.int(93, "SMA: Long Period", minval=1, group="OMS SMA")
+
+// ── RANGE FILTER ──
+i_rf_mult = input.float(defval=0.8, minval=0.1, title="Range Multiplier", group="OMS Range Filter")
+i_dailyPer = input.int(defval=25, minval=1, title="Daily Sampling Period", group="OMS Range Filter")
+i_weeklyPer = input.int(defval=14, minval=1, title="Weekly Sampling Period", group="OMS Range Filter")
+
+// ── OCC STRATEGY ──
+i_useRes = input.bool(true, title="OCC: Use Alternate Resolution?", group="OMS OCC")
+i_stratRes = input.timeframe("W", title="OCC: Alternate Resolution", group="OMS OCC")
+i_basisType = input.string("VWMA", title="OCC: MA Type", options=["SMA", "EMA", "DEMA", "TEMA", "WMA", "VWMA", "SMMA", "HullMA", "LSMA", "ALMA", "SSMA", "TMA"], group="OMS OCC")
+i_basisLen = input.int(25, title="OCC: MA Period", minval=1, group="OMS OCC")
+i_offsetSigma = input.int(6, title="OCC: Offset for LSMA / Sigma for ALMA", minval=0, group="OMS OCC")
+i_offsetALMA = input.float(0.85, title="OCC: Offset for ALMA", minval=0, step=0.01, group="OMS OCC")
+i_delayOffset = input.int(1, title="OCC: Delay (Non-Repainting)", minval=0, step=1, group="OMS OCC")
+
+// ── SHINOHARA STRATEGY ──
+i_shinoharaLen = input.int(title="Shinohara: Length", defval=125, group="OMS Shinohara")
+i_shinoharaMinDiff = input.float(title="Shinohara: Minimum Diff Threshold", defval=14.0, step=1, group="OMS Shinohara")
+i_shinoharaSlowSMA = input.int(title="Shinohara: Slow SMA Period", defval=100, group="OMS Shinohara")
+i_shinoharaOffsetFactor = input.float(title="Shinohara: Offset Factor", defval=45.0, step=1, group="OMS Shinohara")
+i_shinoharaMaxOffset = input.float(title="Shinohara: Max Offset (%)", defval=55.0, step=1, group="OMS Shinohara")
+
+// ── VISUAL SETTINGS ──
+i_showBuyZone = input.bool(true, "Show Green Buy Zone", group="Visuals")
+i_showWarningZone = input.bool(true, "Show Red Warning Zone", group="Visuals")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIMPLE SMA MODE CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+sma_main   = ta.sma(close, i_smaLength)
+sma_filter = ta.sma(close, i_filterLength)
+
+rawBull_SMA  = close > sma_main
+rawBear_SMA  = close < sma_main
+
+var int bullConfirmedBars = 0
+var int bearConfirmedBars = 0
+
+if rawBull_SMA
+    bullConfirmedBars += 1
+    bearConfirmedBars := 0
+else if rawBear_SMA
+    bearConfirmedBars += 1
+    bullConfirmedBars := 0
+else
+    bullConfirmedBars := 0
+    bearConfirmedBars := 0
+
+sma_regimeBull = bullConfirmedBars >= i_minBarsAbove
+sma_regimeBear = bearConfirmedBars >= i_minBarsBelow
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OMS MODE CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Custom ADX Function ──
+f_adxCalc(len) =>
+    up = high - high[1]
+    down = low[1] - low
+    plusDM = (up > down and up > 0) ? up : 0.0
+    minusDM = (down > up and down > 0) ? down : 0.0
+    tr = ta.tr(true)
+    atr = ta.rma(tr, len)
+    plusDM_smoothed = ta.rma(plusDM, len)
+    minusDM_smoothed = ta.rma(minusDM, len)
+    plusDI = 100 * plusDM_smoothed / atr
+    minusDI = 100 * minusDM_smoothed / atr
+    dx = 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+    ta.rma(dx, len)
+
+// ── DAILY TIMEFRAME CALCULATIONS ──
+d_ao = request.security(syminfo.tickerid, "D", ta.sma(hl2, 5) - ta.sma(hl2, 34), lookahead=barmerge.lookahead_off)
+d_diff = d_ao - d_ao[1]
+d_meanDiff = request.security(syminfo.tickerid, "D", ta.sma(d_diff, i_zLookback), lookahead=barmerge.lookahead_off)
+d_stdDiff = request.security(syminfo.tickerid, "D", ta.stdev(d_diff, i_zLookback), lookahead=barmerge.lookahead_off)
+d_z = d_stdDiff != 0 ? (d_diff - d_meanDiff) / d_stdDiff : 0
+d_atr = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead=barmerge.lookahead_off)
+d_atrAvg = request.security(syminfo.tickerid, "D", ta.sma(ta.atr(14), i_zLookback), lookahead=barmerge.lookahead_off)
+d_volFactor = d_atrAvg != 0 ? d_atr / d_atrAvg : 1.0
+d_adx = request.security(syminfo.tickerid, "D", f_adxCalc(14), lookahead=barmerge.lookahead_off)
+d_regimeMultiplier = d_adx < i_adxThreshold ? 1.5 : 1.0
+d_adaptiveThreshold = i_baseZThreshold * d_volFactor * d_regimeMultiplier
+d_buy = ta.crossover(d_z, d_adaptiveThreshold)
+d_sell = ta.crossunder(d_z, -d_adaptiveThreshold)
+
+// ── WEEKLY TIMEFRAME CALCULATIONS ──
+w_ao = request.security(syminfo.tickerid, "W", ta.sma(hl2, 5) - ta.sma(hl2, 34), lookahead=barmerge.lookahead_off)
+w_diff = w_ao - w_ao[1]
+w_meanDiff = request.security(syminfo.tickerid, "W", ta.sma(w_diff, i_zLookback), lookahead=barmerge.lookahead_off)
+w_stdDiff = request.security(syminfo.tickerid, "W", ta.stdev(w_diff, i_zLookback), lookahead=barmerge.lookahead_off)
+w_z = w_stdDiff != 0 ? (w_diff - w_meanDiff) / w_stdDiff : 0
+w_atr = request.security(syminfo.tickerid, "W", ta.atr(14), lookahead=barmerge.lookahead_off)
+w_atrAvg = request.security(syminfo.tickerid, "W", ta.sma(ta.atr(14), i_zLookback), lookahead=barmerge.lookahead_off)
+w_volFactor = w_atrAvg != 0 ? w_atr / w_atrAvg : 1.0
+w_adx = request.security(syminfo.tickerid, "W", f_adxCalc(14), lookahead=barmerge.lookahead_off)
+w_regimeMultiplier = w_adx < i_adxThreshold ? 1.5 : 1.0
+w_adaptiveThreshold = i_baseZThreshold * w_volFactor * w_regimeMultiplier
+w_buy = ta.crossover(w_z, w_adaptiveThreshold)
+w_sell = ta.crossunder(w_z, -w_adaptiveThreshold)
+
+// ── ADAPTIVE SUPERTREND ──
+f_supertrendDir(factor, atr_val) =>
+    src_st = hl2
+    upperBand = src_st + factor * atr_val
+    lowerBand = src_st - factor * atr_val
+    prevLowerBand = nz(lowerBand[1])
+    prevUpperBand = nz(upperBand[1])
+    lowerBand := lowerBand > prevLowerBand or close[1] < prevLowerBand ? lowerBand : prevLowerBand
+    upperBand := upperBand < prevUpperBand or close[1] > prevUpperBand ? upperBand : prevUpperBand
+    var int _direction = na
+    var float superTrend = na
+    prevSuperTrend = superTrend[1]
+    if na(atr_val[1])
+        _direction := 1
+    else if prevSuperTrend == prevUpperBand
+        _direction := close > upperBand ? -1 : 1
+    else
+        _direction := close < lowerBand ? 1 : -1
+    superTrend := _direction == -1 ? lowerBand : upperBand
+    _direction
+
+d_stDir = request.security(syminfo.tickerid, "D", f_supertrendDir(i_dailyFactor, ta.atr(i_dailyATR_len)), lookahead=barmerge.lookahead_off)
+
+// ── SMA STRATEGY (OMS) ──
+oms_short = ta.sma(close, i_oms_sma_short)
+oms_medium = ta.sma(close, i_oms_sma_medium)
+oms_long = ta.sma(close, i_oms_sma_long)
+oms_smaBuy = oms_short > oms_medium and oms_medium > oms_long
+oms_smaSell = oms_short < oms_medium and oms_medium < oms_long
+
+// ── RANGE FILTER ──
+f_smoothrng(x, t, m) =>
+    wper = t * 2 - 1
+    avrng = ta.ema(math.abs(x - x[1]), t)
+    ta.ema(avrng, wper) * m
+
+f_rngfilt(x, r) =>
+    var float _rf = na
+    _rf := x > nz(_rf[1]) ? (x - r < nz(_rf[1]) ? nz(_rf[1]) : x - r) : (x + r > nz(_rf[1]) ? nz(_rf[1]) : x + r)
+    _rf
+
+// Daily Range Filter
+d_filt = request.security(syminfo.tickerid, "D", f_rngfilt(close, f_smoothrng(close, i_dailyPer, i_rf_mult)), lookahead=barmerge.lookahead_off)
+f_dUpward() =>
+    _df = f_rngfilt(close, f_smoothrng(close, i_dailyPer, i_rf_mult))
+    var float du = 0.0
+    du := _df > _df[1] ? nz(du[1]) + 1 : _df < _df[1] ? 0 : nz(du[1])
+    du
+f_dDownward() =>
+    _df = f_rngfilt(close, f_smoothrng(close, i_dailyPer, i_rf_mult))
+    var float dd = 0.0
+    dd := _df < _df[1] ? nz(dd[1]) + 1 : _df > _df[1] ? 0 : nz(dd[1])
+    dd
+d_upward = request.security(syminfo.tickerid, "D", f_dUpward(), lookahead=barmerge.lookahead_off)
+d_downward = request.security(syminfo.tickerid, "D", f_dDownward(), lookahead=barmerge.lookahead_off)
+d_longCond = (close > d_filt and close > close[1] and d_upward > 0) or (close > d_filt and close < close[1] and d_upward > 0)
+d_shortCond = (close < d_filt and close < close[1] and d_downward > 0) or (close < d_filt and close > close[1] and d_downward > 0)
+var int d_condIni = 0
+d_condIni := d_longCond ? 1 : d_shortCond ? -1 : d_condIni[1]
+
+// Weekly Range Filter
+w_filt = request.security(syminfo.tickerid, "W", f_rngfilt(close, f_smoothrng(close, i_weeklyPer, i_rf_mult)), lookahead=barmerge.lookahead_off)
+f_wUpward() =>
+    _wf = f_rngfilt(close, f_smoothrng(close, i_weeklyPer, i_rf_mult))
+    var float wu = 0.0
+    wu := _wf > _wf[1] ? nz(wu[1]) + 1 : _wf < _wf[1] ? 0 : nz(wu[1])
+    wu
+f_wDownward() =>
+    _wf = f_rngfilt(close, f_smoothrng(close, i_weeklyPer, i_rf_mult))
+    var float wd = 0.0
+    wd := _wf < _wf[1] ? nz(wd[1]) + 1 : _wf > _wf[1] ? 0 : nz(wd[1])
+    wd
+w_upward = request.security(syminfo.tickerid, "W", f_wUpward(), lookahead=barmerge.lookahead_off)
+w_downward = request.security(syminfo.tickerid, "W", f_wDownward(), lookahead=barmerge.lookahead_off)
+w_longCond = (close > w_filt and close > close[1] and w_upward > 0) or (close > w_filt and close < close[1] and w_upward > 0)
+w_shortCond = (close < w_filt and close < close[1] and w_downward > 0) or (close < w_filt and close > close[1] and w_downward > 0)
+var int w_condIni = 0
+w_condIni := w_longCond ? 1 : w_shortCond ? -1 : w_condIni[1]
+
+// ── OCC STRATEGY ──
+f_variant(type, src_var, len, offSig, offALMA_var) =>
+    v1 = ta.sma(src_var, len)
+    v2 = ta.ema(src_var, len)
+    v3 = 2 * v2 - ta.ema(v2, len)
+    v4 = 3 * (v2 - ta.ema(v2, len)) + ta.ema(ta.ema(v2, len), len)
+    v5 = ta.wma(src_var, len)
+    v6 = ta.vwma(src_var, len)
+    v7 = 0.0
+    v7 := na(v7[1]) ? ta.sma(src_var, len) : (v7[1] * (len - 1) + src_var) / len
+    v8 = ta.wma(2 * ta.wma(src_var, len / 2) - ta.wma(src_var, len), math.round(math.sqrt(len)))
+    v9 = ta.linreg(src_var, len, offSig)
+    v10 = ta.alma(src_var, len, offALMA_var, offSig)
+    v11 = ta.sma(v1, len)
+    a1 = math.exp(-1.414 * 3.14159 / len)
+    b1 = 2 * a1 * math.cos(1.414 * 3.14159 / len)
+    c2 = b1
+    c3 = (-a1) * a1
+    c1 = 1 - c2 - c3
+    v12 = 0.0
+    v12 := c1 * (src_var + nz(src_var[1])) / 2 + c2 * nz(v12[1]) + c3 * nz(v12[2])
+    type == "EMA" ? v2 : type == "DEMA" ? v3 : type == "TEMA" ? v4 : type == "WMA" ? v5 : type == "VWMA" ? v6 : type == "SMMA" ? v7 : type == "HullMA" ? v8 : type == "LSMA" ? v9 : type == "ALMA" ? v10 : type == "TMA" ? v11 : type == "SSMA" ? v12 : v1
+
+f_reso(exp, use, res) => use ? request.security(syminfo.tickerid, res, exp, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : exp
+
+occ_closeSeries = f_variant(i_basisType, close[i_delayOffset], i_basisLen, i_offsetSigma, i_offsetALMA)
+occ_openSeries = f_variant(i_basisType, open[i_delayOffset], i_basisLen, i_offsetSigma, i_offsetALMA)
+occ_closeAlt = f_reso(occ_closeSeries, i_useRes, i_stratRes)
+occ_openAlt = f_reso(occ_openSeries, i_useRes, i_stratRes)
+occ_long = ta.crossover(occ_closeAlt, occ_openAlt)
+occ_short = ta.crossunder(occ_closeAlt, occ_openAlt)
+
+// ── SHINOHARA STRATEGY ──
+shin_A_bull = math.sum(high, i_shinoharaLen) - math.sum(open, i_shinoharaLen)
+shin_A_bear = math.sum(open, i_shinoharaLen) - math.sum(low, i_shinoharaLen)
+shin_A_ratio = shin_A_bull != 0 ? (100 * shin_A_bear / shin_A_bull) - 18 : 0
+shin_B_bull = math.sum(high, i_shinoharaLen) - math.sum(close[1], i_shinoharaLen)
+shin_B_bear = math.sum(close[1], i_shinoharaLen) - math.sum(low, i_shinoharaLen)
+shin_B_ratio = shin_B_bear != 0 ? (100 * shin_B_bull / shin_B_bear) : 0
+shin_slowSMA = ta.sma(close, i_shinoharaSlowSMA)
+shin_rawOffset = shin_slowSMA != 0 ? i_shinoharaOffsetFactor * (close - shin_slowSMA) / shin_slowSMA : 0
+shin_offset = shin_rawOffset > i_shinoharaMaxOffset ? i_shinoharaMaxOffset : shin_rawOffset < -i_shinoharaMaxOffset ? -i_shinoharaMaxOffset : shin_rawOffset
+shin_adjA = shin_A_ratio - shin_offset
+shin_adjB = shin_B_ratio + shin_offset
+shin_zone = shin_adjB > shin_adjA + i_shinoharaMinDiff ? "buy" : shin_adjA > shin_adjB + i_shinoharaMinDiff ? "sell" : "neutral"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OMS MOMENTUM SCORE CALCULATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// SuperTrend contribution
+st_signal = d_stDir < 0 ? 1 : d_stDir > 0 ? -1 : 0
+st_contrib = st_signal * i_weightSupertrend * (i_useVolBoost ? d_volFactor : 1.0)
+
+// Range Filter contributions
+rf_d_signal = d_condIni == 1 ? 1 : d_condIni == -1 ? -1 : 0
+rf_d_contrib = rf_d_signal * i_weightRangeDaily * (i_useVolBoost ? d_volFactor : 1.0)
+
+rf_w_signal = w_condIni == 1 ? 1 : w_condIni == -1 ? -1 : 0
+rf_w_contrib = rf_w_signal * i_weightRangeWeekly * (i_useVolBoost ? w_volFactor : 1.0)
+
+// OCC contribution
+var string occ_state = "neutral"
+if occ_long
+    occ_state := "buy"
+else if occ_short
+    occ_state := "sell"
+occ_signal = occ_state == "buy" ? 1 : occ_state == "sell" ? -1 : 0
+occ_contrib = occ_signal * i_weightOCC
+
+// Shinohara contribution
+shin_signal = shin_zone == "buy" ? 1 : shin_zone == "sell" ? -1 : 0
+shin_contrib = shin_signal * i_weightShinohara
+
+// SMA contribution (OMS version)
+oms_smaSignal = oms_smaBuy ? 1 : oms_smaSell ? -1 : 0
+sma_contrib = oms_smaSignal * i_weightSMA
+
+// Oscillator contributions
+var float osc_d_signal = 0.0
+if d_buy
+    osc_d_signal := 1
+if d_sell
+    osc_d_signal := -1
+osc_d_contrib = osc_d_signal * i_weightOscDaily * (i_useVolBoost ? d_volFactor : 1.0)
+
+var float osc_w_signal = 0.0
+if w_buy
+    osc_w_signal := 1
+if w_sell
+    osc_w_signal := -1
+osc_w_contrib = osc_w_signal * i_weightOscWeekly * (i_useVolBoost ? w_volFactor : 1.0)
+
+// Base momentum score
+baseMomScore = sma_contrib + occ_contrib + st_contrib + rf_d_contrib + rf_w_contrib + shin_contrib + osc_d_contrib + osc_w_contrib
+
+// Add slope component
+momSlope = ta.linreg(baseMomScore, i_slopeLookback, 0) - ta.linreg(baseMomScore, i_slopeLookback, i_slopeLookback - 1)
+slope_contrib = momSlope * i_weightSlope
+momScore = baseMomScore + slope_contrib
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OMS BUY/SELL SIGNALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+rawBuy_OMS = ta.crossover(momScore, i_momentumThreshold)
+rawSell_OMS = ta.crossunder(momScore, -i_momentumThreshold)
+
+omsBuy = rawBuy_OMS and (not i_useSMAConfirm or oms_smaBuy)
+omsSell = rawSell_OMS and (not i_useSMAConfirm or oms_smaSell)
+
+var bool omsRegimeBull = false
+if omsBuy
+    omsRegimeBull := true
+if omsSell
+    omsRegimeBull := false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// UNIFIED REGIME STATE (MODE SELECTION)
+// ══════════════════════════════════════════════════════════════════════════════
+
+var bool smaRegimeState = false
+if sma_regimeBull and not sma_regimeBull[1]
+    smaRegimeState := true
+if sma_regimeBear and not sma_regimeBear[1]
+    smaRegimeState := false
+
+regimeBull = i_useOMSMode ? omsRegimeBull : smaRegimeState
+
+regimeChanged = regimeBull != regimeBull[1]
+regimeEntry = regimeBull and not regimeBull[1]
+regimeExit = not regimeBull and regimeBull[1]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+if regimeEntry
+    strategy.entry("Long", strategy.long)
+
+if regimeExit
+    strategy.close("Long")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLOTS & VISUALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+plot(not i_useOMSMode ? sma_main : na, "Main SMA", color.orange, 2)
+
+bgcolor(i_showBuyZone and regimeBull ? color.new(color.green, 90) : na, title="Bull Regime")
+bgcolor(i_showWarningZone and not regimeBull ? color.new(color.red, 90) : na, title="Bear Regime")
+
+plotshape(regimeEntry, title="Regime Buy", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="BUY")
+plotshape(regimeExit, title="Regime Sell", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SELL")
+
+plot(i_useOMSMode ? momScore : na, title="Momentum Score", color=color.purple, linewidth=2)
+hline(i_useOMSMode ? i_momentumThreshold : na, "Buy Threshold", color=color.green, linestyle=hline.style_dashed)
+hline(i_useOMSMode ? -i_momentumThreshold : na, "Sell Threshold", color=color.red, linestyle=hline.style_dashed)
+
+plot(regimeBull ? 1 : 0, "Regime Bull", color=color.teal, display=display.data_window)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WEBHOOK ALERTS (FINAL: Unified Signal + Connection)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── REGIME CHANGE ALERTS ──
+// Fires only when the trend flips and the bar closes.
+if regimeChanged and barstate.isconfirmed
+    string alert_signal = regimeBull ? "BUY" : "SELL"
+    
+    // We include the script field here too, ensuring the connection stays "fresh" on every signal.
+    alert('{"ticker":"' + syminfo.prefix + ':' + syminfo.ticker + '", "signal":"' + alert_signal + '", "script":"ctf"}', alert.freq_once_per_bar_close)
+
+alertcondition(regimeEntry, title="Commodities Regime Buy", message="Commodities regime turned BULLISH for {{ticker}}")
+alertcondition(regimeExit, title="Commodities Regime Sell", message="Commodities regime turned BEARISH for {{ticker}}")

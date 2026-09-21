@@ -1,0 +1,1212 @@
+//@version=5
+strategy("TMS — Trade Management System", overlay=true, shorttitle="TMS - Trade Management System",
+         initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, 
+         process_orders_on_close=true, pyramiding=20,
+         commission_type=strategy.commission.percent, commission_value=0.1, slippage=2)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ATR STOP + OSCILLATOR STRATEGY
+// ══════════════════════════════════════════════════════════════════════════════
+// Two entry modes: Manual (specific date) or Auto (OMS Buy Zone)
+// ATR Trailing Stop for risk management
+// Oscillator adds/trims for position management
+// OMS Sell = 20% trim (continues holding 80%)
+// Stopped in Sell Zone = Full exit, done
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 1: ENTRY MODE & STRATEGY SETTINGS
+// ══════════════════════════════════════════════════════════════════════════════
+
+entryGroup = "Entry Mode"
+entryMode = input.string("Manual Date", "Entry Mode", options=["Manual Date", "Auto (OMS)"], group=entryGroup,
+     tooltip="Manual: Enter on specified date\nAuto: Enter on OMS Buy Zone")
+manualEntryDate = input.time(timestamp("2025-01-01 00:00"), "Manual Entry Date", group=entryGroup,
+     tooltip="Only used if Entry Mode = Manual Date")
+
+stratGroup = "Strategy Settings"
+omsSellTrimPct = input.float(20.0, "OMS Sell Trim %", minval=5, maxval=50, step=5, group=stratGroup,
+     tooltip="Percentage to trim when OMS exits buy zone")
+addCooldownInput = input.int(12, "Add Cooldown (bars)", minval=0, maxval=20, group=stratGroup)
+
+// ── MONTHLY CONTRIBUTION SETTINGS ──
+enableContributions = input.bool(true, "Enable Monthly Contributions", group="Monthly Contributions")
+contributionType = input.string("Fixed", "Contribution Type", options=["Fixed", "Percent"], group="Monthly Contributions")
+fixedContribution = input.float(200.0, "Fixed Monthly Amount ($)", minval=0, step=10, group="Monthly Contributions")
+pctContribution = input.float(5.0, "Monthly Contribution (% of Initial)", minval=0, maxval=10, step=0.1, group="Monthly Contributions")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 2: OSCILLATOR SETTINGS (Primary tuning)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── OSCILLATOR EXECUTION ──
+oscExecGroup = "Oscillator Execution"
+enableOscExecution = input.bool(true, "Enable Oscillator Execution", group=oscExecGroup,
+     tooltip="When enabled, oscillator signals execute trades")
+largeAddPct = input.float(100.0, "Large Add (% of Pool)", minval=0, maxval=100, step=1, group=oscExecGroup,
+     tooltip="Percentage of available pool to spend on large adds")
+smallAddPct = input.float(90.0, "Small Add (% of Pool)", minval=0, maxval=100, step=1, group=oscExecGroup,
+     tooltip="Percentage of available pool to spend on small adds")
+largeTrimPct = input.float(15.0, "Large Trim (% of Position)", minval=0, maxval=100, step=5, group=oscExecGroup,
+     tooltip="Percentage of position to trim (proceeds go to pool)")
+smallTrimPct = input.float(5.0, "Small Trim (% of Position)", minval=0, maxval=100, step=1, group=oscExecGroup,
+     tooltip="Percentage of position to trim (proceeds go to pool)")
+
+// ── MTF TIMEFRAME SELECTION ──
+show1D = input.bool(true, "Show 1D Signals", group="Oscillator Timeframes")
+show2D = input.bool(true, "Show 2D Signals", group="Oscillator Timeframes")
+show3D = input.bool(false, "Show 3D Signals", group="Oscillator Timeframes")
+enableDCA = input.bool(true, "Enable 1M DCA Signal", group="Oscillator Timeframes",
+     tooltip="Monthly DCA on entry anniversary day")
+
+// ── OSCILLATOR SETTINGS ──
+max_gap = input.int(3, "Max Gap Bars to Join", minval=0, group="Oscillator Settings")
+add_threshold = input.int(2, "Add Score Threshold", minval=1, maxval=20, group="Oscillator Settings")
+src_bb = input.source(hlc3, "Bollinger %b Source", group="Oscillator Settings")
+
+// ── VOLATILITY SETTINGS ──
+hv_length = input.int(60, "Historical Volatility Length", minval=1, group="Oscillator Volatility")
+max_consecutive_trims = input.int(2, "Max Consecutive Trims", minval=1, group="Oscillator Volatility")
+
+// ── BOLLINGER BAND SETTINGS ──
+bb_mult = input.float(2.0, "BB StdDev", step=0.1, group="Oscillator BB")
+
+// ── DEDUPLICATION ──
+dedup_lookback = input.int(5, "Dedup Lookback (bars)", minval=1, maxval=10, group="Oscillator Dedup")
+
+// ── VWMA-AO SETTINGS ──
+src_ao = input.source(high, "AO Source", group="Oscillator VWMA-AO")
+short_vwma_len = input.int(3, "Short VWMA Length", minval=1, group="Oscillator VWMA-AO")
+long_vwma_len = input.int(32, "Long VWMA Length", minval=1, group="Oscillator VWMA-AO")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 3: OMS REGIME INPUTS (Stable params)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── INDICATOR WEIGHTS ──
+weightSMA = input.float(3.0, "Weight: SMA Strategy", step=0.1, group="OMS Weights")
+weightOCC = input.float(2.0, "Weight: OCC", step=0.1, group="OMS Weights")
+weightSupertrend = input.float(2.0, "Weight: Adaptive SuperTrend", step=0.1, group="OMS Weights")
+weightRangeDaily = input.float(2.0, "Weight: Range Filter Daily", step=0.1, group="OMS Weights")
+weightRangeWeekly = input.float(4.0, "Weight: Range Filter Weekly", step=0.1, group="OMS Weights")
+weightShinohara = input.float(2.0, "Weight: Shinohara Intensity Ratio", step=0.1, group="OMS Weights")
+weightOscDaily = input.float(0.0, "Weight: Oscillator Daily", step=0.1, group="OMS Weights")
+weightOscWeekly = input.float(1.0, "Weight: Oscillator Weekly", step=0.1, group="OMS Weights")
+momentumThreshold = input.float(12.0, "Momentum Threshold", step=0.1, group="OMS Weights")
+
+// ── MOMENTUM SLOPE ──
+slopeLookback = input.int(3, "Momentum Slope Lookback", minval=1, group="OMS Momentum")
+weightSlope = input.float(0.5, "Weight: Momentum Slope", step=0.1, group="OMS Momentum")
+
+// ── SIGNAL FILTERS ──
+useSMAConfirm = input.bool(true, "Use SMA Confirmation", group="OMS Filters")
+useVolBoost = input.bool(true, "Boost by Volatility", group="OMS Filters")
+
+// ── Z-SCORE SETTINGS ──
+zLookback = input.int(10, "Z-Score Lookback", minval=1, group="OMS Z-Score")
+baseZThreshold = input.float(1.2, "Base Z Threshold", step=0.1, group="OMS Z-Score")
+adxThreshold = input.float(20.0, "ADX Threshold", step=0.1, group="OMS Z-Score")
+
+// ── SUPERTREND SETTINGS ──
+dailyATR_len = input.int(3, "ST: Daily ATR Length", group="OMS SuperTrend")
+dailyFactor = input.float(3.5, "ST: Daily Factor", group="OMS SuperTrend")
+
+// ── SMA STRATEGY ──
+sma_short_period = input.int(5, "SMA: Short Period", minval=1, group="OMS SMA")
+sma_medium_period = input.int(82, "SMA: Medium Period", minval=1, group="OMS SMA")
+sma_long_period = input.int(93, "SMA: Long Period", minval=1, group="OMS SMA")
+
+// ── RANGE FILTER ──
+src = input(defval=close, title="Source", group="OMS Range Filter")
+per = input.int(defval=2, minval=1, title="Base Sampling Period", group="OMS Range Filter")
+mult_rf = input.float(defval=0.8, minval=0.1, title="Range Multiplier", group="OMS Range Filter")
+dailyPer = input.int(defval=25, minval=1, title="Daily Sampling Period", group="OMS Range Filter")
+weeklyPer = input.int(defval=14, minval=1, title="Weekly Sampling Period", group="OMS Range Filter")
+
+// ── OCC STRATEGY ──
+useRes = input.bool(true, title="Use Alternate Resolution?", group="OMS OCC")
+stratRes = input.timeframe("W", title="Alternate Resolution", group="OMS OCC")
+basisType = input.string("VWMA", title="MA Type", options=["SMA", "EMA", "DEMA", "TEMA", "WMA", "VWMA", "SMMA", "HullMA", "LSMA", "ALMA", "SSMA", "TMA"], group="OMS OCC")
+basisLen = input.int(25, title="MA Period", minval=1, group="OMS OCC")
+offsetSigma = input.int(6, title="Offset for LSMA", minval=0, group="OMS OCC")
+offsetALMA = input.float(0.85, title="Offset for ALMA", minval=0, step=0.01, group="OMS OCC")
+delayOffset = input.int(1, title="Delay Offset", minval=0, step=1, group="OMS OCC")
+
+// ── SHINOHARA STRATEGY ──
+shinoharaLen = input.int(125, "Shinohara: Length", group="OMS Shinohara")
+shinoharaMinDiff = input.float(14.0, "Shinohara: Min Diff", step=1, group="OMS Shinohara")
+shinoharaSlowSMAPeriod = input.int(100, "Shinohara: Slow SMA", group="OMS Shinohara")
+shinoharaOffsetFactor = input.float(45.0, "Shinohara: Offset Factor", step=1, group="OMS Shinohara")
+shinoharaMaxOffset = input.float(55.0, "Shinohara: Max Offset %", step=1, group="OMS Shinohara")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 4: ATR STOP INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+atrGroup = "ATR Stop Loss"
+atrLength = input.int(60, "ATR Period", minval=1, group=atrGroup)
+atrMultiplier = input.float(14.0, "ATR Multiplier", minval=0.1, step=0.1, group=atrGroup)
+useLogATR = input.bool(true, "Use Logarithmic ATR", group=atrGroup)
+smaPeriod = input.int(15, "SMA Anchor Period", minval=1, maxval=50, group=atrGroup)
+
+stopLimitGroup = "Stop Limits"
+useMinStopPercent = input.bool(false, "Use Minimum Stop %", group=stopLimitGroup)
+minStopPercent = input.float(15.0, "Minimum Stop %", minval=5.0, maxval=50.0, step=1.0, group=stopLimitGroup)
+useMaxStopPercent = input.bool(true, "Use Maximum Stop %", group=stopLimitGroup)
+maxStopPercent = input.float(35.0, "Maximum Stop %", minval=20.0, maxval=90.0, step=5.0, group=stopLimitGroup)
+
+hybridGroup = "VWMA-ATR Hybrid"
+useVWMAHybrid = input.bool(true, "Enable VWMA-ATR Hybrid", group=hybridGroup)
+vwmaPeriod = input.int(70, "VWMA Period", minval=10, maxval=200, group=hybridGroup)
+vwmaWeight = input.float(0.1, "VWMA Weight", minval=0.0, maxval=0.8, step=0.1, group=hybridGroup)
+vwmaOffset = input.float(0.06, "VWMA Offset %", minval=0.01, maxval=0.2, step=0.01, group=hybridGroup)
+
+triggerGroup = "Stop Loss Trigger"
+useVwmaTrigger = input.bool(true, "Use VWMA to Trigger Stop", group=triggerGroup, tooltip="If checked, cuts position when VWMA crosses below ATR stop instead of raw price wicks.")
+vwmaTriggerLen = input.int(25, "Trigger VWMA Length", minval=1, maxval=200, group=triggerGroup)
+
+// ── VISUALS ──
+showStopLine = input.bool(true, "Show Stop Loss Line", group="Visuals")
+showZoneBg = input.bool(true, "Show Zone Background", group="Visuals")
+showOscSignals = input.bool(true, "Show Oscillator Signals", group="Visuals")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 5: OMS REGIME CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Custom ADX Function ──
+adxCalc(len) =>
+    up = high - high[1]
+    down = low[1] - low
+    plusDM = (up > down and up > 0) ? up : 0.0
+    minusDM = (down > up and down > 0) ? down : 0.0
+    tr = ta.tr(true)
+    atr_adx = ta.rma(tr, len)
+    plusDM_smoothed = ta.rma(plusDM, len)
+    minusDM_smoothed = ta.rma(minusDM, len)
+    plusDI = 100 * plusDM_smoothed / atr_adx
+    minusDI = 100 * minusDM_smoothed / atr_adx
+    dx = 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+    ta.rma(dx, len)
+
+// ── Daily/Weekly Timeframe Calculations ──
+dailyAO = request.security(syminfo.tickerid, "D", ta.sma(hl2, 5) - ta.sma(hl2, 34), lookahead=barmerge.lookahead_off)
+dailyDiff = dailyAO - dailyAO[1]
+dailyMeanDiff = request.security(syminfo.tickerid, "D", ta.sma(dailyDiff, zLookback), lookahead=barmerge.lookahead_off)
+dailyStdDiff = request.security(syminfo.tickerid, "D", ta.stdev(dailyDiff, zLookback), lookahead=barmerge.lookahead_off)
+dailyZ = (dailyDiff - dailyMeanDiff) / dailyStdDiff
+dailyATR_oms = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead=barmerge.lookahead_off)
+dailyATRAvg = request.security(syminfo.tickerid, "D", ta.sma(ta.atr(14), zLookback), lookahead=barmerge.lookahead_off)
+dailyVolFactor = dailyATR_oms / dailyATRAvg
+dailyADX = request.security(syminfo.tickerid, "D", adxCalc(14), lookahead=barmerge.lookahead_off)
+dailyRegimeMultiplier = dailyADX < adxThreshold ? 1.5 : 1.0
+dailyAdaptiveThreshold = baseZThreshold * dailyVolFactor * dailyRegimeMultiplier
+dailyBuy = ta.crossover(dailyZ, dailyAdaptiveThreshold)
+dailySell = ta.crossunder(dailyZ, -dailyAdaptiveThreshold)
+
+weeklyAO = request.security(syminfo.tickerid, "W", ta.sma(hl2, 5) - ta.sma(hl2, 34), lookahead=barmerge.lookahead_off)
+weeklyDiff = weeklyAO - weeklyAO[1]
+weeklyMeanDiff = request.security(syminfo.tickerid, "W", ta.sma(weeklyDiff, zLookback), lookahead=barmerge.lookahead_off)
+weeklyStdDiff = request.security(syminfo.tickerid, "W", ta.stdev(weeklyDiff, zLookback), lookahead=barmerge.lookahead_off)
+weeklyZ = (weeklyDiff - weeklyMeanDiff) / weeklyStdDiff
+weeklyATR_oms = request.security(syminfo.tickerid, "W", ta.atr(14), lookahead=barmerge.lookahead_off)
+weeklyATRAvg = request.security(syminfo.tickerid, "W", ta.sma(ta.atr(14), zLookback), lookahead=barmerge.lookahead_off)
+weeklyVolFactor = weeklyATR_oms / weeklyATRAvg
+weeklyADX = request.security(syminfo.tickerid, "W", adxCalc(14), lookahead=barmerge.lookahead_off)
+weeklyRegimeMultiplier = weeklyADX < adxThreshold ? 1.5 : 1.0
+weeklyAdaptiveThreshold = baseZThreshold * weeklyVolFactor * weeklyRegimeMultiplier
+weeklyBuy = ta.crossover(weeklyZ, weeklyAdaptiveThreshold)
+weeklySell = ta.crossunder(weeklyZ, -weeklyAdaptiveThreshold)
+
+// ── Adaptive SuperTrend ──
+pine_supertrend_dir(factor, atr_val) =>
+    src_st = hl2
+    upperBand = src_st + factor * atr_val
+    lowerBand = src_st - factor * atr_val
+    prevLowerBand = nz(lowerBand[1])
+    prevUpperBand = nz(upperBand[1])
+    lowerBand := lowerBand > prevLowerBand or close[1] < prevLowerBand ? lowerBand : prevLowerBand
+    upperBand := upperBand < prevUpperBand or close[1] > prevUpperBand ? upperBand : prevUpperBand
+    var int _direction = na
+    var float superTrend = na
+    prevSuperTrend = superTrend[1]
+    if na(atr_val[1])
+        _direction := 1
+    else if prevSuperTrend == prevUpperBand
+        _direction := close > upperBand ? -1 : 1
+    else
+        _direction := close < lowerBand ? 1 : -1
+    superTrend := _direction == -1 ? lowerBand : upperBand
+    _direction
+
+dailyDir = request.security(syminfo.tickerid, "D", pine_supertrend_dir(dailyFactor, ta.atr(dailyATR_len)), lookahead=barmerge.lookahead_off)
+
+// ── SMA Strategy ──
+sma_short = ta.sma(close, sma_short_period)
+sma_medium = ta.sma(close, sma_medium_period)
+sma_long = ta.sma(close, sma_long_period)
+smaBuySignal = sma_short > sma_medium and sma_medium > sma_long
+smaSellSignal = sma_short < sma_medium and sma_medium < sma_long
+
+// ── Range Filter ──
+smoothrng(x, t, m) =>
+    wper = t * 2 - 1
+    avrng = ta.ema(math.abs(x - x[1]), t)
+    ta.ema(avrng, wper) * m
+
+rngfilt(x, r) =>
+    _rf = x
+    _rf := x > nz(_rf[1]) ? (x - r < nz(_rf[1]) ? nz(_rf[1]) : x - r) : (x + r > nz(_rf[1]) ? nz(_rf[1]) : x + r)
+    _rf
+
+dailyFilt = request.security(syminfo.tickerid, "D", rngfilt(src, smoothrng(src, dailyPer, mult_rf)), lookahead=barmerge.lookahead_off)
+
+f_dailyUpward() =>
+    _df = rngfilt(close, smoothrng(close, dailyPer, mult_rf))
+    var float du = 0.0
+    du := _df > _df[1] ? nz(du[1]) + 1 : _df < _df[1] ? 0 : nz(du[1])
+    du
+
+f_dailyDownward() =>
+    _df = rngfilt(close, smoothrng(close, dailyPer, mult_rf))
+    var float dd = 0.0
+    dd := _df < _df[1] ? nz(dd[1]) + 1 : _df > _df[1] ? 0 : nz(dd[1])
+    dd
+
+dailyUpward = request.security(syminfo.tickerid, "D", f_dailyUpward(), lookahead=barmerge.lookahead_off)
+dailyDownward = request.security(syminfo.tickerid, "D", f_dailyDownward(), lookahead=barmerge.lookahead_off)
+
+dailyLongCond = (src > dailyFilt and src > src[1] and dailyUpward > 0) or (src > dailyFilt and src < src[1] and dailyUpward > 0)
+dailyShortCond = (src < dailyFilt and src < src[1] and dailyDownward > 0) or (src < dailyFilt and src > src[1] and dailyDownward > 0)
+dailyCondIni = 0
+dailyCondIni := dailyLongCond ? 1 : dailyShortCond ? -1 : dailyCondIni[1]
+
+weeklyFilt = request.security(syminfo.tickerid, "W", rngfilt(src, smoothrng(src, weeklyPer, mult_rf)), lookahead=barmerge.lookahead_off)
+
+f_weeklyUpward() =>
+    _wf = rngfilt(src, smoothrng(src, weeklyPer, mult_rf))
+    var float wu = 0.0
+    wu := _wf > _wf[1] ? nz(wu[1]) + 1 : _wf < _wf[1] ? 0 : nz(wu[1])
+    wu
+
+f_weeklyDownward() =>
+    _wf = rngfilt(src, smoothrng(src, weeklyPer, mult_rf))
+    var float wd = 0.0
+    wd := _wf < _wf[1] ? nz(wd[1]) + 1 : _wf > _wf[1] ? 0 : nz(wd[1])
+    wd
+
+weeklyUpward = request.security(syminfo.tickerid, "W", f_weeklyUpward(), lookahead=barmerge.lookahead_off)
+weeklyDownward = request.security(syminfo.tickerid, "W", f_weeklyDownward(), lookahead=barmerge.lookahead_off)
+
+weeklyLongCond = (src > weeklyFilt and src > src[1] and weeklyUpward > 0) or (src > weeklyFilt and src < src[1] and weeklyUpward > 0)
+weeklyShortCond = (src < weeklyFilt and src < src[1] and weeklyDownward > 0) or (src < weeklyFilt and src > src[1] and weeklyDownward > 0)
+weeklyCondIni = 0
+weeklyCondIni := weeklyLongCond ? 1 : weeklyShortCond ? -1 : weeklyCondIni[1]
+
+// ── OCC Strategy ──
+variant(type, src_var, len, offSig, offALMA_var) =>
+    v1 = ta.sma(src_var, len)
+    v2 = ta.ema(src_var, len)
+    v3 = 2 * v2 - ta.ema(v2, len)
+    v4 = 3 * (v2 - ta.ema(v2, len)) + ta.ema(ta.ema(v2, len), len)
+    v5 = ta.wma(src_var, len)
+    v6 = ta.vwma(src_var, len)
+    v7 = 0.0
+    v7 := na(v7[1]) ? ta.sma(src_var, len) : (v7[1] * (len - 1) + src_var) / len
+    v8 = ta.wma(2 * ta.wma(src_var, len / 2) - ta.wma(src_var, len), math.round(math.sqrt(len)))
+    v9 = ta.linreg(src_var, len, offSig)
+    v10 = ta.alma(src_var, len, offALMA_var, offSig)
+    v11 = ta.sma(v1, len)
+    type == "EMA" ? v2 : type == "DEMA" ? v3 : type == "TEMA" ? v4 : type == "WMA" ? v5 : type == "VWMA" ? v6 : type == "SMMA" ? v7 : type == "HullMA" ? v8 : type == "LSMA" ? v9 : type == "ALMA" ? v10 : type == "TMA" ? v11 : v1
+
+reso(exp, use, res) => use ? request.security(syminfo.tickerid, res, exp, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : exp
+
+closeSeries = variant(basisType, close[delayOffset], basisLen, offsetSigma, offsetALMA)
+openSeries = variant(basisType, open[delayOffset], basisLen, offsetSigma, offsetALMA)
+closeSeriesAlt = reso(closeSeries, useRes, stratRes)
+openSeriesAlt = reso(openSeries, useRes, stratRes)
+OCClongCond = ta.crossover(closeSeriesAlt, openSeriesAlt)
+OCCshortCond = ta.crossunder(closeSeriesAlt, openSeriesAlt)
+
+// ── Shinohara Strategy ──
+shinohara_A_bull = math.sum(high, shinoharaLen) - math.sum(open, shinoharaLen)
+shinohara_A_bear = math.sum(open, shinoharaLen) - math.sum(low, shinoharaLen)
+shinohara_A_ratio = (100 * shinohara_A_bear / shinohara_A_bull) - 18
+shinohara_B_bull = math.sum(high, shinoharaLen) - math.sum(close[1], shinoharaLen)
+shinohara_B_bear = math.sum(close[1], shinoharaLen) - math.sum(low, shinoharaLen)
+shinohara_B_ratio = (100 * shinohara_B_bull / shinohara_B_bear)
+shinoharaSlowSMA = ta.sma(close, shinoharaSlowSMAPeriod)
+shinoharaRawOffset = shinoharaOffsetFactor * (close - shinoharaSlowSMA) / shinoharaSlowSMA
+shinoharaOffset = shinoharaRawOffset > shinoharaMaxOffset ? shinoharaMaxOffset : shinoharaRawOffset < -shinoharaMaxOffset ? -shinoharaMaxOffset : shinoharaRawOffset
+shinoharaAdjA = shinohara_A_ratio - shinoharaOffset
+shinoharaAdjB = shinohara_B_ratio + shinoharaOffset
+shinoharaCurrentZone = shinoharaAdjB > shinoharaAdjA + shinoharaMinDiff ? "buy" : shinoharaAdjA > shinoharaAdjB + shinoharaMinDiff ? "sell" : "neutral"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6: MOMENTUM SCORE AND ZONE STATE
+// ══════════════════════════════════════════════════════════════════════════════
+
+supertrendSignal = dailyDir < 0 ? 1 : dailyDir > 0 ? -1 : 0
+supertrendContribution = supertrendSignal * weightSupertrend * (useVolBoost ? dailyVolFactor : 1.0)
+
+rangeDailySignal = dailyCondIni == 1 ? 1 : dailyCondIni == -1 ? -1 : 0
+rangeDailyContribution = rangeDailySignal * weightRangeDaily * (useVolBoost ? dailyVolFactor : 1.0)
+
+rangeWeeklySignal = weeklyCondIni == 1 ? 1 : weeklyCondIni == -1 ? -1 : 0
+rangeWeeklyContribution = rangeWeeklySignal * weightRangeWeekly * (useVolBoost ? weeklyVolFactor : 1.0)
+
+var string occState = "neutral"
+if OCClongCond
+    occState := "buy"
+else if OCCshortCond
+    occState := "sell"
+occSignal = occState == "buy" ? 1 : occState == "sell" ? -1 : 0
+occContribution = occSignal * weightOCC
+
+shinoharaSignal = shinoharaCurrentZone == "buy" ? 1 : shinoharaCurrentZone == "sell" ? -1 : 0
+shinoharaContribution = shinoharaSignal * weightShinohara
+
+smaSignal = smaBuySignal ? 1 : smaSellSignal ? -1 : 0
+smaContribution = smaSignal * weightSMA
+
+var float oscDailySignal = 0.0
+if dailyBuy
+    oscDailySignal := 1
+if dailySell
+    oscDailySignal := -1
+oscDailyContribution = oscDailySignal * weightOscDaily * (useVolBoost ? dailyVolFactor : 1.0)
+
+var float oscWeeklySignal = 0.0
+if weeklyBuy
+    oscWeeklySignal := 1
+if weeklySell
+    oscWeeklySignal := -1
+oscWeeklyContribution = oscWeeklySignal * weightOscWeekly * (useVolBoost ? weeklyVolFactor : 1.0)
+
+baseMomentumScore = smaContribution + occContribution + supertrendContribution + rangeDailyContribution + rangeWeeklyContribution + shinoharaContribution + oscDailyContribution + oscWeeklyContribution
+momentumSlope = ta.linreg(baseMomentumScore, slopeLookback, 0) - ta.linreg(baseMomentumScore, slopeLookback, slopeLookback - 1)
+slopeContribution = momentumSlope * weightSlope
+momentumScore = baseMomentumScore + slopeContribution
+
+// ── FIXED OMS SIGNALS ──
+bool momentumBullish = momentumScore >= momentumThreshold
+bool momentumBearish = momentumScore <= -momentumThreshold
+
+bool macroBullish = momentumBullish and (not useSMAConfirm or smaBuySignal)
+bool macroBearish = momentumBearish and (not useSMAConfirm or smaSellSignal)
+
+// ── Zone State ──
+var bool inBuyZone = false
+if macroBullish
+    inBuyZone := true
+else if macroBearish
+    inBuyZone := false
+
+// Zone transition markers
+omsBuyMarker = macroBullish and not inBuyZone[1]
+omsSellMarker = macroBearish and inBuyZone[1]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 7: ATR TRAILING STOP CALCULATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+smaClose = ta.sma(close, smaPeriod)
+atr = useLogATR ? (ta.atr(atrLength) / close) * close : ta.atr(atrLength)
+vwma_stop = ta.vwma(close, vwmaPeriod)
+anchorPrice = smaClose
+
+// Calculate stop level
+currentATRDistance = atr * atrMultiplier
+currentATRPercent = (currentATRDistance / anchorPrice) * 100
+
+currentLimitedPercent = currentATRPercent
+if useMinStopPercent and currentATRPercent < minStopPercent
+    currentLimitedPercent := minStopPercent
+if useMaxStopPercent and currentATRPercent > maxStopPercent
+    currentLimitedPercent := maxStopPercent
+
+currentEffectiveDistance = anchorPrice * (currentLimitedPercent / 100)
+currentPureATRStop = anchorPrice - currentEffectiveDistance
+currentVWMAStop = vwma_stop * (1 - vwmaOffset)
+stopValue = useVWMAHybrid ? (currentPureATRStop * (1 - vwmaWeight)) + (currentVWMAStop * vwmaWeight) : currentPureATRStop
+
+// Trailing stop - only trails up, resets on new entry
+var float atrTrailingStop = na
+var bool stoppedOutWaiting = false  // Waiting for re-entry after stop in buy zone
+var float availablePool = 0.0  // Pool for oscillator adds (from trims and DCA)
+
+// ── MANUAL POSITION TRACKING (like Script B) ──
+var bool positionActive = false
+hasPosition = strategy.position_size > 0
+
+// Sync manual state with actual position (handles entries)
+if hasPosition and not hasPosition[1]
+    positionActive := true
+    atrTrailingStop := stopValue
+
+// Update trailing stop when position is active
+if positionActive and hasPosition
+    atrTrailingStop := math.max(stopValue, nz(atrTrailingStop[1], stopValue))
+
+// ── STOP HIT DETECTION (immediate, like Script B) ──
+triggerVwma = ta.vwma(close, vwmaTriggerLen)
+
+bool stopHit = false
+if positionActive and not na(atrTrailingStop)
+    if useVwmaTrigger
+        stopHit := triggerVwma <= atrTrailingStop
+    else
+        stopHit := low <= atrTrailingStop
+
+// Handle stop hit IMMEDIATELY
+if stopHit
+    positionActive := false
+    atrTrailingStop := na
+    if inBuyZone
+        stoppedOutWaiting := true
+    else
+        stoppedOutWaiting := false
+        availablePool := 0.0
+
+// Sync manual state when strategy actually closes position (backup)
+if hasPosition[1] and not hasPosition and not stopHit
+    positionActive := false
+
+// Clear waiting if zone turns sell while waiting
+if not inBuyZone and stoppedOutWaiting
+    stoppedOutWaiting := false
+    availablePool := 0.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 8: OSCILLATOR CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+oscillatorActive = positionActive or (stoppedOutWaiting and inBuyZone)
+
+// ── Historical Volatility ──
+annual = 365
+per_hv = timeframe.isintraday or (timeframe.isdaily and timeframe.multiplier == 1) ? 1 : 7
+hv = 100 * ta.stdev(math.log(close / close[1]), hv_length) * math.sqrt(annual / per_hv)
+
+bool isHighVolatility = hv > 90
+int bb_length = isHighVolatility ? 250 : 400
+float bb_threshold = isHighVolatility ? 1.1 : 1.4
+
+// ── RCI Function ──
+rci(src_rci, len) => 
+    if len <= 0 or bar_index < len
+        na
+    else
+        prices = array.new_float(len)
+        for i = 0 to len - 1
+            array.set(prices, i, src_rci[i])
+        sorted_indices = array.sort_indices(prices, order.ascending)
+        price_ranks = array.new_float(len, 0.0)
+        for i = 0 to len - 1
+            idx = array.get(sorted_indices, i)
+            array.set(price_ranks, idx, float(i + 1))
+        sum_d2 = 0.0
+        for i = 0 to len - 1
+            time_rank = float(len - i)
+            price_rank = array.get(price_ranks, i)
+            d = time_rank - price_rank
+            sum_d2 += d * d
+        n = float(len)
+        rho = 1.0 - 6.0 * sum_d2 / (n * (n * n - 1.0))
+        rho * 100.0
+
+// ── FNG Indicator ──
+fng_res = "240"
+fng_p = request.security(syminfo.tickerid, fng_res, close, lookahead=barmerge.lookahead_off)
+fng_t = request.security(syminfo.tickerid, fng_res, ta.tr, lookahead=barmerge.lookahead_off)
+fng_trUp = fng_p > fng_p[1] ? fng_t : 0
+fng_trDn = fng_p < fng_p[1] ? fng_t : 0
+fng_fgi = ta.wma(ta.wma(fng_trUp,15) - ta.wma(fng_trDn,15) - (ta.wma(fng_trUp,18) - ta.wma(fng_trDn,18)), 2)
+fng_avg_tr = ta.wma(fng_t, 150)
+fng_sig = fng_avg_tr != 0 ? 100 * fng_fgi / fng_avg_tr : fng_fgi > 0 ? 1 : fng_fgi < 0 ? -1 : 0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 8A-C: OSCILLATOR SIGNALS (1D, 2D, 3D)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// 1D Signals
+short_vwma_1d = ta.vwma(src_ao, short_vwma_len)
+long_vwma_1d = ta.vwma(src_ao, long_vwma_len)
+ao_1d = short_vwma_1d - long_vwma_1d
+ao_diff_1d = ao_1d - ao_1d[1]
+ao_cross_1d = ta.crossover(ao_diff_1d, 0)
+ao_buy_1d = ao_1d < 0 and ao_1d > ao_1d[1]
+ao_strong_1d = ao_1d < 0 and ao_cross_1d
+
+sqz_val_1d = ta.linreg(close - math.avg(math.avg(ta.highest(high,20), ta.lowest(low,20)), ta.sma(close,20)), 20, 0)
+sqz_diff_1d = sqz_val_1d - sqz_val_1d[1]
+sqz_cross_1d = ta.crossover(sqz_diff_1d, 0)
+sqz_buy_1d = sqz_val_1d < 0 and sqz_val_1d > sqz_val_1d[1]
+sqz_strong_1d = sqz_val_1d < 0 and sqz_cross_1d
+
+short_rci_1d = ta.ema(rci(close, 10), 3)
+middle_rci_1d = rci(close, 30)
+long_rci_1d = rci(close, 50)
+rci_buy_1d = long_rci_1d > middle_rci_1d and middle_rci_1d > short_rci_1d and short_rci_1d > short_rci_1d[1] and short_rci_1d < 0 and middle_rci_1d < 70
+rci_ribbon_1d = long_rci_1d > middle_rci_1d and middle_rci_1d > short_rci_1d and short_rci_1d > short_rci_1d[1] and short_rci_1d < 0 and middle_rci_1d < 50
+
+buy_count_1d = (ao_buy_1d ? 1 : 0) + (sqz_buy_1d ? 1 : 0) + (rci_buy_1d ? 1 : 0)
+any_buy_1d = buy_count_1d >= 1
+current_strong_1d = ao_strong_1d or sqz_strong_1d or (buy_count_1d >= 2)
+
+var int last_signal_bar_1d = na
+var bool is_strong_streak_1d = false
+if any_buy_1d
+    bars_since_prev_1d = na(last_signal_bar_1d) ? na : bar_index - last_signal_bar_1d
+    if na(bars_since_prev_1d) or bars_since_prev_1d > max_gap + 1
+        is_strong_streak_1d := current_strong_1d
+    else
+        is_strong_streak_1d := is_strong_streak_1d or current_strong_1d
+    last_signal_bar_1d := bar_index
+
+composite_buy_1d = not na(last_signal_bar_1d) and (bar_index - last_signal_bar_1d) <= max_gap
+
+var int score_1d = 0
+var bool primed_1d = false
+if barstate.isconfirmed
+    if not composite_buy_1d and not rci_ribbon_1d
+        score_1d := 0
+        primed_1d := false
+    else
+        points_1d = 0
+        if composite_buy_1d
+            points_1d += is_strong_streak_1d ? 2 : 1
+        if rci_ribbon_1d
+            points_1d += 2
+        score_1d += points_1d
+        primed_1d := score_1d >= add_threshold
+
+ao_turns_green_1d = ao_diff_1d[1] <= 0 and ao_diff_1d > 0
+raw_large_add_1d = primed_1d and ao_turns_green_1d and ao_1d < 0
+raw_small_add_1d = primed_1d and ao_turns_green_1d and ao_1d >= 0
+
+// Trim Engine 1D
+raw_trim_1d = (ao_diff_1d <= 0) and (sqz_val_1d > 0 and sqz_val_1d <= nz(sqz_val_1d[1])) and (fng_sig < 0)
+
+bb_basis_1d = ta.sma(src_bb, bb_length)
+bb_dev_1d = bb_mult * ta.stdev(src_bb, bb_length)
+bb_upper_1d = bb_basis_1d + bb_dev_1d
+bb_lower_1d = bb_basis_1d - bb_dev_1d
+bb_percent_1d = (src_bb - bb_lower_1d) / (bb_upper_1d - bb_lower_1d)
+
+var bool stretched_1d = false
+stretched_1d := bb_percent_1d >= bb_threshold
+if bb_percent_1d < bb_threshold - 0.1
+    stretched_1d := false
+
+var bool in_trim_1d = false
+new_trim_move_1d = raw_trim_1d and not in_trim_1d
+if new_trim_move_1d
+    in_trim_1d := true
+if not raw_trim_1d
+    in_trim_1d := false
+
+var int consecutive_trims_1d = 0
+bool raw_large_trim_1d = new_trim_move_1d and stretched_1d
+bool raw_small_trim_1d = new_trim_move_1d and not stretched_1d
+bool raw_add_signal_1d = raw_large_add_1d or raw_small_add_1d
+bool allow_trim_1d = consecutive_trims_1d < max_consecutive_trims
+
+if barstate.isconfirmed
+    if raw_add_signal_1d
+        consecutive_trims_1d := 0
+    else if (raw_large_trim_1d or raw_small_trim_1d) and allow_trim_1d
+        consecutive_trims_1d += 1
+
+// 2D Signals
+[close_2d, high_2d, low_2d, src_ao_2d, src_bb_2d] = request.security(syminfo.tickerid, "2D", [close, high, low, src_ao, src_bb], lookahead=barmerge.lookahead_off)
+
+short_vwma_2d = ta.vwma(src_ao_2d, short_vwma_len)
+long_vwma_2d = ta.vwma(src_ao_2d, long_vwma_len)
+ao_2d = short_vwma_2d - long_vwma_2d
+ao_diff_2d = ao_2d - ao_2d[1]
+ao_cross_2d = ta.crossover(ao_diff_2d, 0)
+ao_buy_2d = ao_2d < 0 and ao_2d > ao_2d[1]
+ao_strong_2d = ao_2d < 0 and ao_cross_2d
+
+sqz_val_2d = ta.linreg(close_2d - math.avg(math.avg(ta.highest(high_2d,20), ta.lowest(low_2d,20)), ta.sma(close_2d,20)), 20, 0)
+sqz_diff_2d = sqz_val_2d - sqz_val_2d[1]
+sqz_cross_2d = ta.crossover(sqz_diff_2d, 0)
+sqz_buy_2d = sqz_val_2d < 0 and sqz_val_2d > sqz_val_2d[1]
+sqz_strong_2d = sqz_val_2d < 0 and sqz_cross_2d
+
+short_rci_2d = ta.ema(rci(close_2d, 10), 3)
+middle_rci_2d = rci(close_2d, 30)
+long_rci_2d = rci(close_2d, 50)
+rci_buy_2d = long_rci_2d > middle_rci_2d and middle_rci_2d > short_rci_2d and short_rci_2d > short_rci_2d[1] and short_rci_2d < 0 and middle_rci_2d < 70
+rci_ribbon_2d = long_rci_2d > middle_rci_2d and middle_rci_2d > short_rci_2d and short_rci_2d > short_rci_2d[1] and short_rci_2d < 0 and middle_rci_2d < 50
+
+buy_count_2d = (ao_buy_2d ? 1 : 0) + (sqz_buy_2d ? 1 : 0) + (rci_buy_2d ? 1 : 0)
+any_buy_2d = buy_count_2d >= 1
+current_strong_2d = ao_strong_2d or sqz_strong_2d or (buy_count_2d >= 2)
+
+var int last_signal_bar_2d = na
+var bool is_strong_streak_2d = false
+if any_buy_2d
+    bars_since_prev_2d = na(last_signal_bar_2d) ? na : bar_index - last_signal_bar_2d
+    if na(bars_since_prev_2d) or bars_since_prev_2d > max_gap + 1
+        is_strong_streak_2d := current_strong_2d
+    else
+        is_strong_streak_2d := is_strong_streak_2d or current_strong_2d
+    last_signal_bar_2d := bar_index
+
+composite_buy_2d = not na(last_signal_bar_2d) and (bar_index - last_signal_bar_2d) <= max_gap
+
+var int score_2d = 0
+var bool primed_2d = false
+if barstate.isconfirmed
+    if not composite_buy_2d and not rci_ribbon_2d
+        score_2d := 0
+        primed_2d := false
+    else
+        points_2d = 0
+        if composite_buy_2d
+            points_2d += is_strong_streak_2d ? 2 : 1
+        if rci_ribbon_2d
+            points_2d += 2
+        score_2d += points_2d
+        primed_2d := score_2d >= add_threshold
+
+ao_turns_green_2d = ao_diff_2d[1] <= 0 and ao_diff_2d > 0
+raw_large_add_2d = primed_2d and ao_turns_green_2d and ao_2d < 0
+raw_small_add_2d = primed_2d and ao_turns_green_2d and ao_2d >= 0
+
+raw_trim_2d = (ao_diff_2d <= 0) and (sqz_val_2d > 0 and sqz_val_2d <= nz(sqz_val_2d[1])) and (fng_sig < 0)
+
+bb_basis_2d = ta.sma(src_bb_2d, bb_length)
+bb_dev_2d = bb_mult * ta.stdev(src_bb_2d, bb_length)
+bb_upper_2d = bb_basis_2d + bb_dev_2d
+bb_lower_2d = bb_basis_2d - bb_dev_2d
+bb_percent_2d = (src_bb_2d - bb_lower_2d) / (bb_upper_2d - bb_lower_2d)
+
+var bool stretched_2d = false
+stretched_2d := bb_percent_2d >= bb_threshold
+if bb_percent_2d < bb_threshold - 0.1
+    stretched_2d := false
+
+var bool in_trim_2d = false
+new_trim_move_2d = raw_trim_2d and not in_trim_2d
+if new_trim_move_2d
+    in_trim_2d := true
+if not raw_trim_2d
+    in_trim_2d := false
+
+var int consecutive_trims_2d = 0
+bool raw_large_trim_2d = new_trim_move_2d and stretched_2d
+bool raw_small_trim_2d = new_trim_move_2d and not stretched_2d
+bool raw_add_signal_2d = raw_large_add_2d or raw_small_add_2d
+bool allow_trim_2d = consecutive_trims_2d < max_consecutive_trims
+
+if barstate.isconfirmed
+    if raw_add_signal_2d
+        consecutive_trims_2d := 0
+    else if (raw_large_trim_2d or raw_small_trim_2d) and allow_trim_2d
+        consecutive_trims_2d += 1
+
+is_new_2d_bar = ta.change(time("2D")) != 0
+
+// 3D Signals
+[close_3d, high_3d, low_3d, src_ao_3d, src_bb_3d] = request.security(syminfo.tickerid, "3D", [close, high, low, src_ao, src_bb], lookahead=barmerge.lookahead_off)
+
+short_vwma_3d = ta.vwma(src_ao_3d, short_vwma_len)
+long_vwma_3d = ta.vwma(src_ao_3d, long_vwma_len)
+ao_3d = short_vwma_3d - long_vwma_3d
+ao_diff_3d = ao_3d - ao_3d[1]
+ao_cross_3d = ta.crossover(ao_diff_3d, 0)
+ao_buy_3d = ao_3d < 0 and ao_3d > ao_3d[1]
+ao_strong_3d = ao_3d < 0 and ao_cross_3d
+
+sqz_val_3d = ta.linreg(close_3d - math.avg(math.avg(ta.highest(high_3d,20), ta.lowest(low_3d,20)), ta.sma(close_3d,20)), 20, 0)
+sqz_diff_3d = sqz_val_3d - sqz_val_3d[1]
+sqz_cross_3d = ta.crossover(sqz_diff_3d, 0)
+sqz_buy_3d = sqz_val_3d < 0 and sqz_val_3d > sqz_val_3d[1]
+sqz_strong_3d = sqz_val_3d < 0 and sqz_cross_3d
+
+short_rci_3d = ta.ema(rci(close_3d, 10), 3)
+middle_rci_3d = rci(close_3d, 30)
+long_rci_3d = rci(close_3d, 50)
+rci_buy_3d = long_rci_3d > middle_rci_3d and middle_rci_3d > short_rci_3d and short_rci_3d > short_rci_3d[1] and short_rci_3d < 0 and middle_rci_3d < 70
+rci_ribbon_3d = long_rci_3d > middle_rci_3d and middle_rci_3d > short_rci_3d and short_rci_3d > short_rci_3d[1] and short_rci_3d < 0 and middle_rci_3d < 50
+
+buy_count_3d = (ao_buy_3d ? 1 : 0) + (sqz_buy_3d ? 1 : 0) + (rci_buy_3d ? 1 : 0)
+any_buy_3d = buy_count_3d >= 1
+current_strong_3d = ao_strong_3d or sqz_strong_3d or (buy_count_3d >= 2)
+
+var int last_signal_bar_3d = na
+var bool is_strong_streak_3d = false
+if any_buy_3d
+    bars_since_prev_3d = na(last_signal_bar_3d) ? na : bar_index - last_signal_bar_3d
+    if na(bars_since_prev_3d) or bars_since_prev_3d > max_gap + 1
+        is_strong_streak_3d := current_strong_3d
+    else
+        is_strong_streak_3d := is_strong_streak_3d or current_strong_3d
+    last_signal_bar_3d := bar_index
+
+composite_buy_3d = not na(last_signal_bar_3d) and (bar_index - last_signal_bar_3d) <= max_gap
+
+var int score_3d = 0
+var bool primed_3d = false
+if barstate.isconfirmed
+    if not composite_buy_3d and not rci_ribbon_3d
+        score_3d := 0
+        primed_3d := false
+    else
+        points_3d = 0
+        if composite_buy_3d
+            points_3d += is_strong_streak_3d ? 2 : 1
+        if rci_ribbon_3d
+            points_3d += 2
+        score_3d += points_3d
+        primed_3d := score_3d >= add_threshold
+
+ao_turns_green_3d = ao_diff_3d[1] <= 0 and ao_diff_3d > 0
+raw_large_add_3d = primed_3d and ao_turns_green_3d and ao_3d < 0
+raw_small_add_3d = primed_3d and ao_turns_green_3d and ao_3d >= 0
+
+raw_trim_3d = (ao_diff_3d <= 0) and (sqz_val_3d > 0 and sqz_val_3d <= nz(sqz_val_3d[1])) and (fng_sig < 0)
+
+bb_basis_3d = ta.sma(src_bb_3d, bb_length)
+bb_dev_3d = bb_mult * ta.stdev(src_bb_3d, bb_length)
+bb_upper_3d = bb_basis_3d + bb_dev_3d
+bb_lower_3d = bb_basis_3d - bb_dev_3d
+bb_percent_3d = (src_bb_3d - bb_lower_3d) / (bb_upper_3d - bb_lower_3d)
+
+var bool stretched_3d = false
+stretched_3d := bb_percent_3d >= bb_threshold
+if bb_percent_3d < bb_threshold - 0.1
+    stretched_3d := false
+
+var bool in_trim_3d = false
+new_trim_move_3d = raw_trim_3d and not in_trim_3d
+if new_trim_move_3d
+    in_trim_3d := true
+if not raw_trim_3d
+    in_trim_3d := false
+
+var int consecutive_trims_3d = 0
+bool raw_large_trim_3d = new_trim_move_3d and stretched_3d
+bool raw_small_trim_3d = new_trim_move_3d and not stretched_3d
+bool raw_add_signal_3d = raw_large_add_3d or raw_small_add_3d
+bool allow_trim_3d = consecutive_trims_3d < max_consecutive_trims
+
+if barstate.isconfirmed
+    if raw_add_signal_3d
+        consecutive_trims_3d := 0
+    else if (raw_large_trim_3d or raw_small_trim_3d) and allow_trim_3d
+        consecutive_trims_3d += 1
+
+is_new_3d_bar = ta.change(time("3D")) != 0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 9: DEDUPLICATION AND STRICT WATERFALL SIGNALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// 1. Initial Gating 
+raw_add_3d_L  = raw_large_add_3d and is_new_3d_bar and show3D and positionActive
+raw_add_3d_S  = raw_small_add_3d and is_new_3d_bar and show3D and positionActive
+raw_trim_3d_L = raw_large_trim_3d and allow_trim_3d and is_new_3d_bar and show3D and positionActive
+raw_trim_3d_S = raw_small_trim_3d and allow_trim_3d and is_new_3d_bar and show3D and positionActive
+
+raw_add_2d_L  = raw_large_add_2d and is_new_2d_bar and show2D and positionActive
+raw_add_2d_S  = raw_small_add_2d and is_new_2d_bar and show2D and positionActive
+raw_trim_2d_L = raw_large_trim_2d and allow_trim_2d and is_new_2d_bar and show2D and positionActive
+raw_trim_2d_S = raw_small_trim_2d and allow_trim_2d and is_new_2d_bar and show2D and positionActive
+
+raw_add_1d_L  = raw_large_add_1d and show1D and positionActive
+raw_add_1d_S  = raw_small_add_1d and show1D and positionActive
+raw_trim_1d_L = raw_large_trim_1d and allow_trim_1d and show1D and positionActive
+raw_trim_1d_S = raw_small_trim_1d and allow_trim_1d and show1D and positionActive
+
+// 2. Exact Bar Waterfall Priority (3D > 2D > 1D)
+bool active_add_3d  = raw_add_3d_L or raw_add_3d_S
+bool active_trim_3d = raw_trim_3d_L or raw_trim_3d_S
+
+bool active_add_2d  = (raw_add_2d_L or raw_add_2d_S) and not active_add_3d
+bool active_trim_2d = (raw_trim_2d_L or raw_trim_2d_S) and not active_trim_3d
+
+bool active_add_1d  = (raw_add_1d_L or raw_add_1d_S) and not (active_add_3d or active_add_2d)
+bool active_trim_1d = (raw_trim_1d_L or raw_trim_1d_S) and not (active_trim_3d or active_trim_2d)
+
+// 3. Time-Based Deduplication (Lookback)
+var int last_add_bar = na
+var int last_trim_bar = na
+
+bool any_add_now  = active_add_3d or active_add_2d or active_add_1d
+bool any_trim_now = active_trim_3d or active_trim_2d or active_trim_1d
+
+bool dedup_add_ok  = na(last_add_bar) or (bar_index - last_add_bar) > dedup_lookback
+bool dedup_trim_ok = na(last_trim_bar) or (bar_index - last_trim_bar) > dedup_lookback
+
+if any_add_now and dedup_add_ok
+    last_add_bar := bar_index
+if any_trim_now and dedup_trim_ok
+    last_trim_bar := bar_index
+
+// 4. Final Master Signals (Mutually Exclusive)
+large_add_3d = raw_add_3d_L and dedup_add_ok
+small_add_3d = raw_add_3d_S and dedup_add_ok and not large_add_3d
+
+large_trim_3d = raw_trim_3d_L and dedup_trim_ok
+small_trim_3d = raw_trim_3d_S and dedup_trim_ok and not large_trim_3d
+
+large_add_2d = raw_add_2d_L and active_add_2d and dedup_add_ok
+small_add_2d = raw_add_2d_S and active_add_2d and dedup_add_ok and not large_add_2d
+
+large_trim_2d = raw_trim_2d_L and active_trim_2d and dedup_trim_ok
+small_trim_2d = raw_trim_2d_S and active_trim_2d and dedup_trim_ok and not large_trim_2d
+
+large_add_1d = raw_add_1d_L and active_add_1d and dedup_add_ok
+small_add_1d = raw_add_1d_S and active_add_1d and dedup_add_ok and not large_add_1d
+
+large_trim_1d = raw_trim_1d_L and active_trim_1d and dedup_trim_ok
+small_trim_1d = raw_trim_1d_S and active_trim_1d and dedup_trim_ok and not large_trim_1d
+
+var int lastAddBar = na
+cooldownOk = na(lastAddBar) or (bar_index - lastAddBar) >= addCooldownInput
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 10: STRATEGY EXECUTION
+// ══════════════════════════════════════════════════════════════════════════════
+// ── MANUAL ENTRY DETECTION ──
+isManualMode = entryMode == "Manual Date"
+isManualEntryBar = isManualMode and manualEntryDate != timestamp("2025-01-01") and time >= manualEntryDate and (bar_index == 0 or time[1] < manualEntryDate)
+// ── MONTHLY CONTRIBUTION CALCULATION ──
+monthlyContribution = contributionType == "Fixed" ? fixedContribution : (strategy.initial_capital * pctContribution / 100)
+
+// ── PENDING CONTRIBUTIONS ──
+var float pendingContributions = 0.0
+isNewMonth = month != month[1]
+if enableContributions and isNewMonth
+    pendingContributions += monthlyContribution
+
+// ── DCA TRACKING ──
+var float nextDCATime = na
+var int entryDayOfMonth = na // Kept purely for the info table display in Section 13
+if not hasPosition[1] and hasPosition
+    nextDCATime := time + 2592000000
+    entryDayOfMonth := dayofmonth
+isDCADay = enableDCA and positionActive and not na(nextDCATime) and time >= nextDCATime
+
+// ── HELPER FUNCTIONS ──
+f_safeQty(float value) =>
+    value > 0 ? math.floor(value) : 0
+f_calcAddQty(float pool, float pct) =>
+    float spendAmount = pool * (pct / 100.0)
+    
+
+// ── RE-ENTRY LOGIC ──
+// Requires: SuperTrend bullish AND Daily Range Filter bullish
+reentryConfirm = (dailyDir < 0) and (dailyCondIni == 1)
+reentrySignal = stoppedOutWaiting and inBuyZone and reentryConfirm
+
+// ── SIGNAL PRECEDENCE ──
+// Resolution rules: Higher TF > Lower TF, then Strong > Weak.
+// If add and trim tie on both dimensions, suppress both.
+// Tiers: 3D Strong=6, 3D Weak=5, 2D Strong=4, 2D Weak=3, 1D Strong=2, 1D Weak=1
+int addTier  = large_add_3d  ? 6 : small_add_3d  ? 5 : large_add_2d  ? 4 : small_add_2d  ? 3 : large_add_1d  ? 2 : small_add_1d  ? 1 : 0
+int trimTier = large_trim_3d ? 6 : small_trim_3d ? 5 : large_trim_2d ? 4 : small_trim_2d ? 3 : large_trim_1d ? 2 : small_trim_1d ? 1 : 0
+bool addsAllowed  = addTier  > trimTier
+bool trimsAllowed = trimTier > addTier
+// When tiers are equal and both nonzero, both flags are false → both suppressed
+
+// ── ENTRY LOGIC ──
+// OMS Buy fires on buy zone markers, but in manual mode only after the manual
+// entry date has been reached. This preserves manual mode's purpose (simulating
+// mid-chart entry) while allowing OMS-driven re-entries after stop-outs.
+if omsBuyMarker and not positionActive and not stoppedOutWaiting and (not isManualMode or time >= manualEntryDate)
+    float totalCapital = strategy.equity + pendingContributions
+    float entryQty = math.max(math.floor(totalCapital / close), 1)
+    availablePool := 0.0
+    pendingContributions := 0.0
+    positionActive := true
+    strategy.entry("Long", strategy.long, qty=entryQty, comment="OMS Buy")
+    stoppedOutWaiting := false
+if isManualMode and isManualEntryBar and not positionActive
+    float totalCapital = strategy.equity + pendingContributions
+    float entryQty = math.max(math.floor(totalCapital / close), 1)
+    availablePool := 0.0
+    pendingContributions := 0.0
+    positionActive := true
+    strategy.entry("Long", strategy.long, qty=entryQty, comment="Manual Entry")
+    stoppedOutWaiting := false
+
+// ── RE-ENTRY ──
+if reentrySignal
+    float totalCapital = strategy.equity + pendingContributions
+    float entryQty = math.max(math.floor(totalCapital / close), 1)
+    availablePool := 0.0
+    pendingContributions := 0.0
+    positionActive := true
+    strategy.entry("Long", strategy.long, qty=entryQty, comment="Re-Entry")
+    stoppedOutWaiting := false
+
+// ── BUY ZONE POOL DEPLOYMENT ──
+if omsBuyMarker and positionActive and availablePool > 0 and (not isManualMode or time >= manualEntryDate)
+    float addQty = math.floor(availablePool / close)
+    if addQty >= 1
+        availablePool -= addQty * close
+        strategy.entry("Long", strategy.long, qty=addQty, comment="Buy Zone Pool Deploy")
+        lastAddBar := bar_index
+
+// ── OMS SELL ──
+if omsSellMarker and positionActive and strategy.position_size > 0
+    float trimQty = f_safeQty(strategy.position_size * (omsSellTrimPct / 100))
+    if trimQty >= 1
+        strategy.close("Long", qty=trimQty, comment="OMS Sell Trim " + str.tostring(omsSellTrimPct, "#") + "%")
+
+// ── OSCILLATOR TRIMS ──
+if enableOscExecution and positionActive and strategy.position_size > 0 and trimsAllowed
+    if large_trim_3d and largeTrimPct > 0
+        float trimQty = f_safeQty(strategy.position_size * (largeTrimPct / 100))
+        if trimQty >= 1
+            availablePool += trimQty * close
+            strategy.close("Long", qty=trimQty, comment="3D Strong Trim")
+            
+    else if small_trim_3d and smallTrimPct > 0
+        float trimQty = f_safeQty(strategy.position_size * (smallTrimPct / 100))
+        if trimQty >= 1
+            availablePool += trimQty * close
+            strategy.close("Long", qty=trimQty, comment="3D Small Trim")
+            
+    else if large_trim_2d and largeTrimPct > 0
+        float trimQty = f_safeQty(strategy.position_size * (largeTrimPct / 100))
+        if trimQty >= 1
+            availablePool += trimQty * close
+            strategy.close("Long", qty=trimQty, comment="2D Strong Trim")
+            
+    else if small_trim_2d and smallTrimPct > 0
+        float trimQty = f_safeQty(strategy.position_size * (smallTrimPct / 100))
+        if trimQty >= 1
+            availablePool += trimQty * close
+            strategy.close("Long", qty=trimQty, comment="2D Small Trim")
+            
+    else if large_trim_1d and largeTrimPct > 0
+        float trimQty = f_safeQty(strategy.position_size * (largeTrimPct / 100))
+        if trimQty >= 1
+            availablePool += trimQty * close
+            strategy.close("Long", qty=trimQty, comment="1D Strong Trim")
+            
+    else if small_trim_1d and smallTrimPct > 0
+        float trimQty = f_safeQty(strategy.position_size * (smallTrimPct / 100))
+        if trimQty >= 1
+            availablePool += trimQty * close
+            strategy.close("Long", qty=trimQty, comment="1D Small Trim")
+
+// ── OSCILLATOR ADDS ──
+if enableOscExecution and positionActive and cooldownOk and availablePool > 0 and addsAllowed
+    if large_add_3d and largeAddPct > 0
+        float addQty = f_calcAddQty(availablePool, largeAddPct)
+        if addQty >= 1
+            availablePool -= addQty * close
+            strategy.entry("Long", strategy.long, qty=addQty, comment="3D Strong Add")
+            lastAddBar := bar_index
+            
+    else if small_add_3d and smallAddPct > 0
+        float addQty = f_calcAddQty(availablePool, smallAddPct)
+        if addQty >= 1
+            availablePool -= addQty * close
+            strategy.entry("Long", strategy.long, qty=addQty, comment="3D Small Add")
+            lastAddBar := bar_index
+            
+    else if large_add_2d and largeAddPct > 0
+        float addQty = f_calcAddQty(availablePool, largeAddPct)
+        if addQty >= 1
+            availablePool -= addQty * close
+            strategy.entry("Long", strategy.long, qty=addQty, comment="2D Strong Add")
+            lastAddBar := bar_index
+            
+    else if small_add_2d and smallAddPct > 0
+        float addQty = f_calcAddQty(availablePool, smallAddPct)
+        if addQty >= 1
+            availablePool -= addQty * close
+            strategy.entry("Long", strategy.long, qty=addQty, comment="2D Small Add")
+            lastAddBar := bar_index
+            
+    else if large_add_1d and largeAddPct > 0
+        float addQty = f_calcAddQty(availablePool, largeAddPct)
+        if addQty >= 1
+            availablePool -= addQty * close
+            strategy.entry("Long", strategy.long, qty=addQty, comment="1D Strong Add")
+            lastAddBar := bar_index
+            
+    else if small_add_1d and smallAddPct > 0
+        float addQty = f_calcAddQty(availablePool, smallAddPct)
+        if addQty >= 1
+            availablePool -= addQty * close
+            strategy.entry("Long", strategy.long, qty=addQty, comment="1D Small Add")
+            lastAddBar := bar_index
+// ── ATR STOP ──
+if hasPosition
+    if not useVwmaTrigger and not na(atrTrailingStop)
+        // Default mode: standard broker stop triggered by raw price
+        strategy.exit("ATR Stop", "Long", stop=atrTrailingStop, comment="ATR Stop")
+    else if useVwmaTrigger and stopHit
+        // VWMA mode: conditional market close triggered by smoothed price
+        strategy.close("Long", comment="VWMA ATR Stop")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 11: WEBHOOK ALERTS (GATED TO MATCH STRATEGY EXECUTION)
+// ══════════════════════════════════════════════════════════════════════════════
+// NOTE: Alerts are gated to match Section 10 execution conditions. Add and trim
+// alerts also require barstate.isconfirmed to prevent intra-bar repainting,
+// where a signal flickers true mid-bar and goes false by close. Without that
+// gate, alerts can fire to the backend without a corresponding chart marker.
+
+tickerStr = syminfo.prefix + ":" + syminfo.ticker
+
+// ── PRICE JSON VALUE ──
+priceJsonValue = str.tostring(close, "#.####")
+cdfStateJsonValue = inBuyZone ? "BUY" : "SELL"
+
+// ── EXECUTION GATES (mirror Section 10) ──
+addsExecutable  = enableOscExecution and positionActive and availablePool > 0 and addsAllowed and barstate.isconfirmed
+trimsExecutable = enableOscExecution and positionActive and strategy.position_size > 0 and trimsAllowed and barstate.isconfirmed
+
+// ── ADD SIGNALS ──
+if large_add_3d and cooldownOk and addsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "strong_add", "timeframe": "3D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if small_add_3d and cooldownOk and addsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "weak_add", "timeframe": "3D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if large_add_2d and cooldownOk and addsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "strong_add", "timeframe": "2D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if small_add_2d and cooldownOk and addsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "weak_add", "timeframe": "2D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if large_add_1d and cooldownOk and addsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "strong_add", "timeframe": "1D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if small_add_1d and cooldownOk and addsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "weak_add", "timeframe": "1D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+
+// ── TRIM SIGNALS ──
+if large_trim_3d and trimsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "strong_trim", "timeframe": "3D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if small_trim_3d and trimsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "weak_trim", "timeframe": "3D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if large_trim_2d and trimsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "strong_trim", "timeframe": "2D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if small_trim_2d and trimsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "weak_trim", "timeframe": "2D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if large_trim_1d and trimsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "strong_trim", "timeframe": "1D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+else if small_trim_1d and trimsExecutable
+    alert('{"ticker": "' + tickerStr + '", "signal": "weak_trim", "timeframe": "1D", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+
+// ── EVENT SIGNALS ──
+if omsBuyMarker
+    alert('{"ticker": "' + tickerStr + '", "signal": "cdf_buy_zone", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+if omsSellMarker and positionActive
+    alert('{"ticker": "' + tickerStr + '", "signal": "cdf_sell_zone", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+if stopHit and barstate.isconfirmed
+    alert('{"ticker": "' + tickerStr + '", "signal": "sell", "script": "tms", "price": ' + priceJsonValue + ', "cdf_state": "' + cdfStateJsonValue + '"}', alert.freq_once_per_bar_close)
+if reentrySignal
+    alert('{"ticker": "' + tickerStr + '", "signal": "reentry", "script": "tms", "price": ' + priceJsonValue + '}', alert.freq_once_per_bar_close)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 12: VISUALIZATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+bgcolor(showZoneBg and inBuyZone ? color.new(color.green, 92) : na, title="Buy Zone")
+bgcolor(showZoneBg and not inBuyZone and not positionActive ? color.new(color.red, 95) : na, title="Sell Zone")
+bgcolor(stoppedOutWaiting and inBuyZone ? color.new(color.yellow, 85) : na, title="Re-entry Eligible")
+
+plot(showStopLine and positionActive and not na(atrTrailingStop) ? atrTrailingStop : na,
+     "ATR Trailing Stop", color=color.red, linewidth=2, style=plot.style_linebr)
+
+plot(showStopLine and positionActive and useVwmaTrigger ? triggerVwma : na, 
+     "Trigger VWMA", color=color.new(color.orange, 50), linewidth=1, style=plot.style_line)
+
+plotshape(omsBuyMarker, "OMS Buy Zone", shape.diamond, location.belowbar, color.green, size=size.small, text="BUY\nZONE")
+plotshape(isManualEntryBar, "Manual Entry", shape.triangleup, location.belowbar, color.blue, size=size.normal, text="MANUAL\nENTRY")
+plotshape(omsSellMarker and positionActive, "OMS Sell (Trim)", shape.diamond, location.abovebar, color.orange, size=size.small, text="TRIM")
+plotshape(stopHit and not inBuyZone, "Stop Hit (Full Exit)", shape.xcross, location.belowbar, color.red, size=size.small, text="STOP\n(exit)")
+
+stoppedOutJustSet = stoppedOutWaiting and not stoppedOutWaiting[1]
+
+plotshape(showOscSignals and large_add_1d and cooldownOk, location=location.belowbar, color=#00ff0060, style=shape.triangleup, size=size.normal, text="Add 1D", textcolor=color.white, title="1D Strong Add")
+plotshape(showOscSignals and small_add_1d and cooldownOk, location=location.belowbar, color=color.rgb(50, 205, 50, 42), style=shape.triangleup, size=size.tiny, text="add\n1D", textcolor=color.gray, title="1D Small Add")
+plotshape(showOscSignals and large_trim_1d, location=location.abovebar, color=color.red, style=shape.triangledown, size=size.normal, text="Strong Trim 1D", textcolor=color.white, title="1D Strong Trim")
+plotshape(showOscSignals and small_trim_1d, location=location.abovebar, color=color.red, style=shape.triangledown, size=size.tiny, text="trim\n1D", textcolor=color.gray, title="1D Small Trim")
+
+plotshape(showOscSignals and large_add_2d and cooldownOk, location=location.belowbar, color=color.new(#0080FF, 20), style=shape.triangleup, size=size.normal, text="Add 2D", textcolor=color.white, title="2D Strong Add")
+plotshape(showOscSignals and small_add_2d and cooldownOk, location=location.belowbar, color=color.new(#0080FF, 50), style=shape.triangleup, size=size.tiny, text="add\n2D", textcolor=color.blue, title="2D Small Add")
+plotshape(showOscSignals and large_trim_2d, location=location.abovebar, color=color.new(#FF00FF, 20), style=shape.triangledown, size=size.normal, text="Strong Trim 2D", textcolor=color.white, title="2D Strong Trim")
+plotshape(showOscSignals and small_trim_2d, location=location.abovebar, color=color.new(#FF00FF, 50), style=shape.triangledown, size=size.tiny, text="trim\n2D", textcolor=color.purple, title="2D Small Trim")
+
+plotshape(showOscSignals and large_add_3d and cooldownOk, location=location.belowbar, color=color.new(#FFA500, 20), style=shape.triangleup, size=size.normal, text="Add 3D", textcolor=color.white, title="3D Strong Add")
+plotshape(showOscSignals and small_add_3d and cooldownOk, location=location.belowbar, color=color.new(#FFA500, 50), style=shape.triangleup, size=size.tiny, text="add\n3D", textcolor=color.orange, title="3D Small Add")
+plotshape(showOscSignals and large_trim_3d, location=location.abovebar, color=color.new(#FFD700, 20), style=shape.triangledown, size=size.normal, text="Strong Trim 3D", textcolor=color.white, title="3D Strong Trim")
+plotshape(showOscSignals and small_trim_3d, location=location.abovebar, color=color.new(#FFD700, 50), style=shape.triangledown, size=size.tiny, text="trim\n3D", textcolor=color.yellow, title="3D Small Trim")
+
+
+
+// Debug: Re-entry conditions
+plot(stoppedOutWaiting ? 1 : 0, "Stopped Out Waiting", display=display.data_window)
+plot(inBuyZone ? 1 : 0, "In Buy Zone", display=display.data_window)
+plot(dailyDir < 0 ? 1 : 0, "SuperTrend Bullish", display=display.data_window)
+plot(dailyCondIni == 1 ? 1 : 0, "Daily Range Bullish", display=display.data_window)
+plot(reentryConfirm ? 1 : 0, "Re-entry Confirm", display=display.data_window)
+plot(reentrySignal ? 1 : 0, "Re-entry Signal", display=display.data_window)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 13: INFO TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast
+    var table infoTable = table.new(position.top_right, 2, 14,
+         bgcolor=color.new(color.black, 80), border_width=1, border_color=color.gray)
+    
+    row = 0
+    
+    table.cell(infoTable, 0, row, "Mode:", text_color=color.white, text_size=size.small)
+    modeText = isManualMode ? "MANUAL" : "AUTO (OMS)"
+    modeColor = isManualMode ? color.blue : color.lime
+    table.cell(infoTable, 1, row, modeText, text_color=modeColor, text_size=size.small)
+    row += 1
+    
+    table.cell(infoTable, 0, row, "Position:", text_color=color.white, text_size=size.small)
+    posText = positionActive ? "HOLDING" : stoppedOutWaiting ? "WAITING RE-ENTRY" : "FLAT"
+    posColor = positionActive ? color.green : stoppedOutWaiting ? color.yellow : color.gray
+    table.cell(infoTable, 1, row, posText, text_color=posColor, text_size=size.small)
+    row += 1
+    
+    table.cell(infoTable, 0, row, "Zone:", text_color=color.white, text_size=size.small)
+    zoneText = inBuyZone ? "BUY" : "SELL"
+    zoneColor = inBuyZone ? color.green : color.red
+    table.cell(infoTable, 1, row, zoneText, text_color=zoneColor, text_size=size.small)
+    row += 1
+    
+    table.cell(infoTable, 0, row, "Osc Exec:", text_color=color.white, text_size=size.small)
+    oscExecText = enableOscExecution ? "ON" : "OFF"
+    oscExecColor = enableOscExecution ? color.lime : color.gray
+    table.cell(infoTable, 1, row, oscExecText, text_color=oscExecColor, text_size=size.small)
+    row += 1
+    
+    if positionActive and not na(atrTrailingStop)
+        stopDist = (close - atrTrailingStop) / close * 100
+        table.cell(infoTable, 0, row, "Stop:", text_color=color.white, text_size=size.small)
+        stopColor = stopDist < 10 ? color.red : stopDist < 20 ? color.orange : color.white
+        table.cell(infoTable, 1, row, str.tostring(stopDist, "#.#") + "% away", text_color=stopColor, text_size=size.small)
+        row += 1
+    
+    if positionActive
+        table.cell(infoTable, 0, row, "Shares:", text_color=color.white, text_size=size.small)
+        table.cell(infoTable, 1, row, str.tostring(strategy.position_size, "#"), text_color=color.white, text_size=size.small)
+        row += 1
+    
+    if pendingContributions > 0
+        table.cell(infoTable, 0, row, "Pending $:", text_color=color.white, text_size=size.small)
+        table.cell(infoTable, 1, row, str.tostring(pendingContributions, "#.##"), text_color=color.teal, text_size=size.small)
+        row += 1
+    
+    if availablePool > 0
+        table.cell(infoTable, 0, row, "Pool $:", text_color=color.white, text_size=size.small)
+        table.cell(infoTable, 1, row, str.tostring(availablePool, "#.##"), text_color=color.lime, text_size=size.small)
+        row += 1
+    
+    table.cell(infoTable, 0, row, "Momentum:", text_color=color.white, text_size=size.small)
+    momColor = momentumScore > momentumThreshold ? color.green : momentumScore < -momentumThreshold ? color.red : color.gray
+    table.cell(infoTable, 1, row, str.tostring(momentumScore, "#.#"), text_color=momColor, text_size=size.small)

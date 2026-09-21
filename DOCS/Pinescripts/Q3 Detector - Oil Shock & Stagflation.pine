@@ -1,0 +1,394 @@
+//@version=5
+strategy("Q3 Detector — Oil Shock & Stagflation", overlay=false,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         initial_capital=100000,
+         process_orders_on_close=true)
+
+// ══════════════════════════════════════════════════════════════════════════
+// 1. OIL GUARD SETTINGS
+// ══════════════════════════════════════════════════════════════════════════
+oil_symbol      = input.symbol("NYMEX:CL1!", "Oil Symbol", group="Oil Guard")
+oil_upperBound  = input.float(80.0, "Oil Price Penalty Level", group="Oil Guard")
+oil_rocThresh   = input.float(25.0, "Serious Oil ROC Warning", group="Oil Guard")
+oil_smaLen      = input.int(4, "Oil SMA Length", group="Oil Guard")
+oil_rocLen      = input.int(14, "Oil ROC Length", group="Oil Guard")
+oil_penalty_pct = input.float(28.0, "Equity Cut: High Oil (%)", group="Oil Guard",
+                  tooltip="Points removed when oil SMA > price level")
+oil_spike_pct   = input.float(25.0, "Equity Cut: Oil Spike (%)", group="Oil Guard",
+                  tooltip="Points removed when oil ROC > threshold")
+
+oil_close = request.security(oil_symbol, "D", close, lookahead=barmerge.lookahead_off)
+oil_sma   = ta.sma(oil_close, oil_smaLen)
+oil_roc   = ta.roc(oil_close, oil_rocLen)
+
+// ══════════════════════════════════════════════════════════════════════════
+// 2. CORE REGIME INPUTS
+// ══════════════════════════════════════════════════════════════════════════
+spy_short_len = input.int(40, "SPY Short SMA", group="Core SMAs")
+ma_long_len   = input.int(400, "Long SMA", group="Core SMAs")
+
+// ══════════════════════════════════════════════════════════════════════════
+// 3. MACRO STRESS INFLUENCE
+// ══════════════════════════════════════════════════════════════════════════
+w_nfci          = input.float(0.1, "Weight: NFCI", group="Macro Stress Influence",
+                  tooltip="How much NFCI contributes to the composite stress score")
+w_vix           = input.float(0.1, "Weight: VIX", group="Macro Stress Influence",
+                  tooltip="How much VIX term structure contributes to stress")
+w_breadth       = input.float(0.1, "Weight: Breadth", group="Macro Stress Influence",
+                  tooltip="How much market breadth contributes to stress")
+stress_mult     = input.float(0.5, "Stress → Equity Multiplier", group="Macro Stress Influence",
+                  minval=0.0, maxval=2.0, step=0.1,
+                  tooltip="How aggressively the composite stress score reduces equity %. At 0.5, a stress score of 100 removes 50pp. At 0.0, macro stress is ignored entirely.")
+max_stress_drag = input.float(0.0, "Max Stress Drag (pp)", group="Macro Stress Influence",
+                  minval=0.0, maxval=85.0, step=5.0,
+                  tooltip="Cap on how many percentage points stress can remove. Prevents stress alone from flooring equity.")
+
+// ══════════════════════════════════════════════════════════════════════════
+// 4. POSITION LIMITS
+// ══════════════════════════════════════════════════════════════════════════
+max_equity = input.float(100, "Max Equity %", group="Limits")
+min_equity = input.float(35, "Min Equity %", group="Limits")
+
+// ══════════════════════════════════════════════════════════════════════════
+// 5. REBALANCE SETTINGS
+// ══════════════════════════════════════════════════════════════════════════
+use_weekly   = input.bool(false, "Lock Equity % Weekly", group="Rebalance")
+deadband_pct = input.float(22.0, "Min Rebalance Threshold (%)", group="Rebalance",
+               tooltip="Equity % snaps to multiples of this step size. Alerts only fire when it moves between steps.")
+use_dynamic  = input.bool(true, "Use Dynamic Equity Base", group="Rebalance",
+               tooltip="ON = base sizing on current equity (incl. P&L). OFF = base on initial capital.")
+
+// ══════════════════════════════════════════════════════════════════════════
+// 6. RAMP CONTROL
+// ══════════════════════════════════════════════════════════════════════════
+enable_ramp   = input.bool(true, "Enable Ramp-Up Decay", group="Ramp Control", tooltip="Drops are immediate. Recovery is throttled to max rate per bar. Disabled by default.")
+ramp_rate     = input.float(100.0, "Max Ramp-Up Rate (pp/bar)", group="Ramp Control",minval=0, maxval=500.0, step=1,tooltip="On daily charts this is pp/day. On weekly charts pp/week.")
+ramp_cooldown = input.int(35, "Cooldown Bars After Drop", group="Ramp Control",minval=0, maxval=200,tooltip="After an immediate drop, wait this many bars before allowing any ramp-up. 0 = start ramping next bar.")
+
+// ══════════════════════════════════════════════════════════════════════════
+// DISPLAY
+// ══════════════════════════════════════════════════════════════════════════
+show_dashboard = input.bool(true, "Show Dashboard", group="Display")
+
+// ══════════════════════════════════════════════════════════════════════════
+// 7. INDICATOR MATH
+// ══════════════════════════════════════════════════════════════════════════
+f_get(_s, _e) => request.security(_s, "D", _e, lookahead=barmerge.lookahead_off)
+
+nfci_raw      = f_get("FRED:NFCIRISK", close)
+nfci_z        = (nfci_raw - ta.sma(nfci_raw, 252)) / math.max(ta.stdev(nfci_raw, 252), 0.001)
+nfci_score    = math.max(0, math.min(100, (nz(nfci_z) / 3) * 100))
+
+vix_term      = f_get("VIX", close) / math.max(f_get("VIX3M", close), 0.01)
+vix_score     = nz(math.max(0, math.min(100, (ta.sma(vix_term, 3) - 0.9) / 0.3 * 100)), 0)
+
+breadth_score = nz(math.max(0, math.min(100, (70 - ta.sma(f_get("S5TH", close), 5)) / 40 * 100)), 0)
+
+total_weight  = w_nfci + w_vix + w_breadth
+stress_total  = total_weight > 0 ? (nfci_score * w_nfci + vix_score * w_vix + breadth_score * w_breadth) / total_weight : 0.0
+
+// ══════════════════════════════════════════════════════════════════════════
+// 8. HYBRID EQUITY CALCULATION
+// ══════════════════════════════════════════════════════════════════════════
+spy_price   = f_get("SPY", close)
+regime_bull = ta.sma(spy_price, spy_short_len) > ta.sma(spy_price, ma_long_len)
+
+// Oil drag
+float oil_drag = 0.0
+if oil_sma > oil_upperBound
+    oil_drag += oil_penalty_pct
+if oil_roc > oil_rocThresh
+    oil_drag += oil_spike_pct
+
+// Stress drag
+float stress_drag = math.min(stress_total * stress_mult, max_stress_drag)
+
+// Raw target
+float raw_equity = (regime_bull ? max_equity : min_equity) - stress_drag - oil_drag
+raw_equity := math.max(min_equity, math.min(max_equity, raw_equity))
+
+// Weekly truncation
+var float target_equity = 100.0
+bool new_week = ta.change(time("W")) != 0
+
+if use_weekly
+    if new_week
+        target_equity := raw_equity
+else
+    target_equity := raw_equity
+
+// Quantize to deadband steps
+target_equity := min_equity + math.round((target_equity - min_equity) / deadband_pct) * deadband_pct
+target_equity := math.max(min_equity, math.min(max_equity, target_equity))
+
+// ══════════════════════════════════════════════════════════════════════════
+// 9. ASYMMETRIC RAMP (optional — drops immediate, recovery throttled)
+// ══════════════════════════════════════════════════════════════════════════
+var float ramped_equity   = target_equity
+var int   bars_since_drop = 999
+
+if enable_ramp
+    if target_equity < ramped_equity
+        // Immediate drop
+        ramped_equity   := target_equity
+        bars_since_drop := 0
+    else if target_equity > ramped_equity
+        // Gradual recovery
+        bars_since_drop += 1
+        if bars_since_drop > ramp_cooldown
+            ramped_equity := math.min(target_equity, ramped_equity + ramp_rate)
+    else
+        bars_since_drop += 1
+else
+    ramped_equity := target_equity
+
+// The value everything downstream actually uses
+float effective_equity = enable_ramp ? ramped_equity : target_equity
+
+// ══════════════════════════════════════════════════════════════════════════
+// 10. DELTA REBALANCE ENGINE
+// ══════════════════════════════════════════════════════════════════════════
+float equity_base  = use_dynamic ? strategy.equity : strategy.initial_capital
+float target_value = equity_base * (effective_equity / 100.0)
+int   target_units = math.floor(target_value / close)
+int   current_units = math.max(0, math.round(strategy.position_size))
+
+float current_pct = (current_units * close / equity_base) * 100.0
+float delta_pct   = math.abs(effective_equity - current_pct)
+int   delta_units  = target_units - current_units
+
+bool should_rebalance = use_weekly ? new_week : true
+bool meaningful       = delta_pct > deadband_pct
+
+if should_rebalance and meaningful and not na(close)
+    if delta_units > 0
+        strategy.order("Rebal Buy", strategy.long, qty=delta_units)
+    else if delta_units < 0
+        int sell_qty = math.min(math.abs(delta_units), current_units)
+        if sell_qty > 0
+            strategy.order("Rebal Sell", strategy.short, qty=sell_qty)
+
+// ══════════════════════════════════════════════════════════════════════════
+// 11. VISUALS
+// ══════════════════════════════════════════════════════════════════════════
+plot(target_equity, "HYBRID EQUITY %", color=color.lime, linewidth=4)
+plot(use_weekly ? raw_equity : na, "Raw Equity (untruncated)", color=color.new(color.gray, 60), linewidth=1)
+plot(current_pct, "Actual Exposure %", color=color.new(color.aqua, 30), linewidth=1,
+     style=plot.style_stepline)
+plot(enable_ramp ? ramped_equity : na, "Ramped Equity", color=color.new(color.orange, 40), linewidth=2,
+     style=plot.style_stepline)
+
+hline(65, "Entry Trigger", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+hline(35, "Exit Trigger", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+
+bg_color = (oil_roc > oil_rocThresh) ? color.new(color.yellow, 70) :
+           (oil_sma > oil_upperBound) ? color.new(color.red, 85) : na
+bgcolor(bg_color, title="Oil Guard Active")
+
+// ── Chart Labels on Equity Change ──
+if effective_equity != nz(effective_equity[1])
+    lbl_col = effective_equity > effective_equity[1] ? color.green : color.red
+    lbl_txt = str.tostring(math.round(effective_equity)) + "%"
+    label.new(bar_index, effective_equity, lbl_txt,
+         style=label.style_label_left,
+         color=lbl_col, textcolor=color.white, size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════
+// 12. DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 26, border_width=1)
+
+if show_dashboard and barstate.islast
+    int row = 0
+
+    // Header
+    table.cell(dash, 0, row, "HYBRID REGIME",
+         bgcolor=color.new(color.teal, 20), text_color=color.white, text_size=size.large)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+
+    // ── Equity ──
+    eq_col = effective_equity >= 75 ? color.green : (effective_equity >= 40 ? color.yellow : color.red)
+    table.cell(dash, 0, row, "EQUITY", text_color=color.white, text_size=size.normal)
+    table.cell(dash, 1, row, str.tostring(math.round(effective_equity)) + "%",
+         bgcolor=color.new(eq_col, 30), text_color=color.white, text_size=size.large)
+    row += 1
+
+    table.cell(dash, 0, row, "Actual", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, row, str.tostring(math.round(current_pct)) + "%",
+         text_color=color.gray, text_size=size.small)
+    row += 1
+
+    table.cell(dash, 0, row, "Raw (pre-snap)", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, row, str.tostring(math.round(raw_equity * 10) / 10) + "%",
+         text_color=color.gray, text_size=size.small)
+    row += 1
+
+    // ── Ramp (only if enabled) ──
+    if enable_ramp
+        table.cell(dash, 0, row, "── Ramp ──", text_color=color.gray, text_size=size.tiny)
+        table.merge_cells(dash, 0, row, 1, row)
+        row += 1
+
+        table.cell(dash, 0, row, "Target", text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 1, row, str.tostring(math.round(target_equity)) + "%",
+             text_color=color.white, text_size=size.tiny)
+        row += 1
+
+        bool ramp_wants_up = target_equity > ramped_equity
+        string ramp_status = ""
+        color  ramp_col    = color.gray
+
+        if ramp_wants_up and bars_since_drop <= ramp_cooldown
+            ramp_status := "COOLDOWN " + str.tostring(bars_since_drop) + "/" + str.tostring(ramp_cooldown)
+            ramp_col    := color.gray
+        else if ramp_wants_up
+            ramp_status := "RAMPING +" + str.tostring(ramp_rate, "#.#") + "pp/bar"
+            ramp_col    := color.green
+        else
+            ramp_status := "IDLE"
+            ramp_col    := color.gray
+
+        table.cell(dash, 0, row, "Status", text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 1, row, ramp_status,
+             bgcolor=color.new(ramp_col, 60),
+             text_color=color.white, text_size=size.tiny)
+        row += 1
+
+        float ramp_gap = target_equity - ramped_equity
+        if ramp_gap > 0
+            int bars_to_target = math.ceil(ramp_gap / ramp_rate)
+            table.cell(dash, 0, row, "ETA", text_color=color.white, text_size=size.tiny)
+            table.cell(dash, 1, row, str.tostring(bars_to_target) + " bars",
+                 text_color=color.white, text_size=size.tiny)
+            row += 1
+
+    // ── Macro Stress ──
+    table.cell(dash, 0, row, "── Macro Stress ──", text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+
+    stress_col = stress_total > 60 ? color.red : (stress_total > 35 ? color.orange : color.green)
+    table.cell(dash, 0, row, "Composite", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, row, str.tostring(math.round(stress_total)) + "/100",
+         bgcolor=color.new(stress_col, 60), text_color=color.white, text_size=size.small)
+    row += 1
+
+    nfci_warn = nfci_score > 40
+    table.cell(dash, 0, row, "NFCI", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(nfci_score)) + (nfci_warn ? " ⚠" : ""),
+         bgcolor=color.new(nfci_warn ? color.orange : color.green, 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+
+    vix_warn = vix_score > 40
+    table.cell(dash, 0, row, "VIX Term", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(vix_score)) + (vix_warn ? " ⚠" : ""),
+         bgcolor=color.new(vix_warn ? color.orange : color.green, 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+
+    breadth_warn = breadth_score > 40
+    table.cell(dash, 0, row, "Breadth", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(breadth_score)) + (breadth_warn ? " ⚠" : ""),
+         bgcolor=color.new(breadth_warn ? color.orange : color.green, 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+
+    table.cell(dash, 0, row, "Stress Drag", text_color=color.white, text_size=size.tiny)
+    stress_drag_col = stress_drag > 25 ? color.red : (stress_drag > 10 ? color.orange : color.green)
+    table.cell(dash, 1, row, "-" + str.tostring(math.round(stress_drag * 10) / 10) + "pp",
+         bgcolor=color.new(stress_drag_col, 60),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+
+    // ── Regime ──
+    table.cell(dash, 0, row, "── Regime ──", text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+
+    table.cell(dash, 0, row, "SPY Trend", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, row, regime_bull ? "BULL" : "BEAR",
+         bgcolor=color.new(regime_bull ? color.green : color.red, 50),
+         text_color=color.white, text_size=size.small)
+    row += 1
+
+    // ── Oil Guard ──
+    table.cell(dash, 0, row, "── Oil Guard ──", text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+
+    bool oil_price_hot = oil_sma > oil_upperBound
+    bool oil_roc_hot   = oil_roc > oil_rocThresh
+
+    table.cell(dash, 0, row, "Oil SMA", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, "$" + str.tostring(math.round(oil_sma * 100) / 100) +
+         (oil_price_hot ? " 🚨" : ""),
+         bgcolor=color.new(oil_price_hot ? color.red : color.green, 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+
+    table.cell(dash, 0, row, "Oil ROC", text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, str.tostring(math.round(nz(oil_roc) * 100) / 100) + "%" +
+         (oil_roc_hot ? " 🚨" : ""),
+         bgcolor=color.new(oil_roc_hot ? color.red : color.green, 70),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+
+    table.cell(dash, 0, row, "Oil Drag", text_color=color.white, text_size=size.tiny)
+    oil_drag_col = oil_drag > 25 ? color.red : (oil_drag > 0 ? color.orange : color.green)
+    table.cell(dash, 1, row, "-" + str.tostring(math.round(oil_drag)) + "pp",
+         bgcolor=color.new(oil_drag_col, 60),
+         text_color=color.white, text_size=size.tiny)
+    row += 1
+
+    // ── Summary ──
+    table.cell(dash, 0, row, "── Summary ──", text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(dash, 0, row, 1, row)
+    row += 1
+
+    float total_drag = stress_drag + oil_drag
+    total_drag_col = total_drag > 40 ? color.red : (total_drag > 15 ? color.orange : color.green)
+    table.cell(dash, 0, row, "Total Drag", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, row, "-" + str.tostring(math.round(total_drag * 10) / 10) + "pp",
+         bgcolor=color.new(total_drag_col, 40),
+         text_color=color.white, text_size=size.small)
+    row += 1
+
+    // ── Rebalance ──
+    string rebal_mode = use_weekly ? "WEEKLY" : "DAILY"
+    string rebal_status = meaningful ? (delta_units > 0 ? "BUY PENDING" : "SELL PENDING") : "ON TARGET"
+    rebal_col = meaningful ? (delta_units > 0 ? color.green : color.red) : color.gray
+    table.cell(dash, 0, row, rebal_mode, text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, row, rebal_status,
+         bgcolor=color.new(rebal_col, 60),
+         text_color=color.white, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════
+// 13. WEBHOOK ALERTS (FINAL: Unified Signal + Heartbeat)
+// ══════════════════════════════════════════════════════════════════════════
+// Webhook endpoint: https://alpha-edge-backend.fly.dev/api/webhook/regime
+// When creating alert: select "Any alert() function call"
+// Set webhook URL, leave message field empty
+// ══════════════════════════════════════════════════════════════════════════
+
+// This permanently remembers the last equity sent to your backend
+var float last_sent_equity = -1.0
+
+// ── TICKER STRING ──
+tickerStr = syminfo.prefix + ":" + syminfo.ticker
+
+// ── DAILY RECONCILIATION HEARTBEAT (MASTER INDEX ONLY) ──
+is_master_ticker = syminfo.ticker == "SPY" or syminfo.ticker == "SPX" 
+is_new_day = ta.change(time("D")) != 0
+
+if is_master_ticker and barstate.isrealtime and is_new_day
+    alert('{"ticker": "' + tickerStr + '", "signal": "heartbeat", "target_equity_pct": ' + str.tostring(effective_equity, "#.#") + ', "script": "q3d"}', alert.freq_once_per_bar_close)
+
+// ── EQUITY CHANGE ──
+if should_rebalance and (effective_equity != last_sent_equity)
+    if last_sent_equity != -1.0
+        alert('{"ticker": "' + tickerStr + '", "signal": "update", "target_equity_pct": ' + str.tostring(effective_equity, "#.#") + ', "script": "q3d"}', alert.freq_once_per_bar_close)
+    
+    last_sent_equity := effective_equity

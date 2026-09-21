@@ -1,0 +1,13 @@
+.detail { font: 13px/1.45 system-ui; }
+.detail > header { padding: 8px 12px; gap: 10px; }
+.detail [data-testid='market-detail-back'] { width: 30px; height: 30px; flex: 0 0 30px; border-radius: 3px; }
+.detail [data-testid='market-detail-back'] svg { width: 16px; height: 16px; }
+.detail > header h2 { font-size: 15px; font-weight: 500; line-height: 1.4; letter-spacing: 0; text-transform: none; }
+.detail > header p { font-size: 11px; line-height: 1.4; }
+.detail > div { padding: 12px; }
+.detail section > div { padding: 10px 12px; }
+.detail section > div > p:first-child,
+.detail section > div > div > p:first-child { font-size: 11px; line-height: 1.4; letter-spacing: 0; text-transform: none; opacity: 1; }
+.detail h3 { font-size: 13px; font-weight: 500; line-height: 1.4; letter-spacing: 0; text-transform: none; }
+.detail button:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; }
+@media (pointer: coarse) { .detail [data-testid='market-detail-back'] { width: 36px; height: 36px; flex-basis: 36px; } }
