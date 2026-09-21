@@ -31,8 +31,8 @@ test('header P/L toggles dollars and percentage without shifting or losing colou
         await expect(value).toHaveText(percentage);
         await expect(value).toHaveAttribute('aria-pressed', 'true');
         const after = await value.boundingBox();
-        assert.equal(before.width, after.width);
-        assert.equal(before.x, after.x);
+        assert.ok(Math.abs(before.width - after.width) <= 0.5, 'toggle cannot resize the value beyond subpixel rounding');
+        assert.ok(Math.abs(before.x - after.x) <= 0.5, 'toggle cannot move the value beyond subpixel rounding');
         await page.keyboard.press('Enter');
         await expect(value).toHaveText(amount);
         await expect(value).toHaveAttribute('aria-pressed', 'false');

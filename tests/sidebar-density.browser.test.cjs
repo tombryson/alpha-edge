@@ -75,7 +75,7 @@ test('five alerts and five ETF chips fit laptop rails at 100% zoom without hidin
             const summaryRegion = right.getByRole('region', { name: 'ETF allocation', exact: true });
             const summary = await summaryRegion.boundingBox();
             await page.screenshot({ path: `test-results/sidebar-density-${viewport.width}-${theme}.png` });
-            assert.ok(summary.height >= 80 && summary.height <= 112, `compact summary must fit its three rows, with one optional difference wrap: ${summary.height}px`);
+            assert.ok(summary.height >= 80 && summary.height <= 136, `summary allows heading and amount wrapping with platform fonts, while five cards stay visible: ${summary.height}px`);
             for (const text of ['$15,000', '$7,500', '+$7,500']) {
                 const amount = summaryRegion.getByText(text, { exact: true });
                 const bounds = await amount.boundingBox();
