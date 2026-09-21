@@ -40,7 +40,7 @@ flowchart TB
 | **Portfolio Analysis** | Reviews the portfolio as a whole and produces memos to inform its asset-class shape. |
 
 These three workflows live together in the separate **Alpha Edge Intelligence**
-application. This repository, **`trading-terminal`**, contains the Trading Terminal:
+application. This repository contains the **Trading Terminal**:
 holdings, approved shapes, research views, signals, decisions and broker-statement
 reconciliation. Intelligence supplies evidence; the Terminal keeps the portfolio
 record and the user makes the decisions.

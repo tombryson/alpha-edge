@@ -30,7 +30,8 @@ Do not restore a financial database just to undo an authentication change.
 
 ## Publication
 
-Do not make the existing repository public before completing the
-[publication checklist](DOCS/development/PUBLIC_SOURCE.md). The check
-must cover all remote branches, tags, releases and artifacts, not only HEAD.
+Publish only a separately reviewed clean-source snapshot, following the
+[publication checklist](DOCS/development/PUBLIC_SOURCE.md). Operational repositories
+may retain private data in their history and must not be made public as a shortcut.
+The check must cover all remote branches, tags, releases and artifacts, not only HEAD.
 Automated tests and secret scans are useful checks, not a security certification.

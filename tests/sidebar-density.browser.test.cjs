@@ -72,9 +72,18 @@ test('five alerts and five ETF chips fit laptop rails at 100% zoom without hidin
                 }
             }
             await expect(chips.last()).toBeInViewport({ ratio: 1 });
-            const summary = await right.getByRole('region', { name: 'ETF allocation', exact: true }).boundingBox();
+            const summaryRegion = right.getByRole('region', { name: 'ETF allocation', exact: true });
+            const summary = await summaryRegion.boundingBox();
             await page.screenshot({ path: `test-results/sidebar-density-${viewport.width}-${theme}.png` });
-            assert.ok(summary.height >= 88 && summary.height <= 112, 'the summary may wrap its larger difference onto one extra line without truncating dollars');
+            assert.ok(summary.height >= 80 && summary.height <= 112, `compact summary must fit its three rows, with one optional difference wrap: ${summary.height}px`);
+            for (const text of ['$15,000', '$7,500', '+$7,500']) {
+                const amount = summaryRegion.getByText(text, { exact: true });
+                const bounds = await amount.boundingBox();
+                assert.ok(bounds.x >= summary.x && bounds.x + bounds.width <= summary.x + summary.width
+                    && bounds.y >= summary.y && bounds.y + bounds.height <= summary.y + summary.height,
+                    'summary amounts must stay inside the section without clipping');
+                assert.ok(await amount.evaluate(el => el.scrollWidth <= el.clientWidth));
+            }
             await expect(left.getByRole('heading', { name: 'ALERT STACK' })).toBeInViewport();
             await expect(right.getByRole('tab', { name: 'ETFs', exact: true })).toBeInViewport();
             await page.screenshot({ path: `test-results/sidebar-density-${viewport.width}-${theme}.png` });

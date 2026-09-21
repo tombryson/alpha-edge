@@ -6,7 +6,7 @@ const base = process.env.CONTEXT_PANEL_BASE_URL || 'http://127.0.0.1:3100';
 
 async function setup(page, pnl) {
     await mockContextPanel(page);
-    await page.route(/\/api\/(?:trading\/)?(?:portfolio|statements\/latest)$/, async route => {
+    await page.route(/\/api\/(?:(?:trading|terminal)\/)?(?:portfolio|statements\/latest)$/, async route => {
         const total = 60000;
         const data = route.request().url().endsWith('/portfolio')
             ? { total_value: total, cash_on_hand: 300, profit_loss: pnl, profit_loss_percent: pnl / total * 100 }
