@@ -12,6 +12,9 @@ const assets = JSON.parse(readFileSync(new URL('./publication-assets.json', impo
 export function checkFiles(root, entries) {
   const errors = [];
   for (const { path, mode } of entries) {
+    if (/(^|\/)(pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$/.test(path)) {
+      errors.push(`${path}: npm is the supported package manager; use package-lock.json only`);
+    }
     if (unsafePath(path) || !['100644', '100755'].includes(mode)) {
       errors.push(`${path}: credentials, data exports, links and submodules are not publishable`);
       continue;

@@ -170,7 +170,7 @@ npm ci
 
 Use npm and the committed `package-lock.json` for reproducible installs. The
 unused Vaul dependency has been removed; no legacy peer-dependency flag is
-required. The old `pnpm-lock.yaml` is not maintained or used by release builds.
+required. npm is the only supported package manager; do not add competing lockfiles.
 
 Start the backend in one terminal:
 

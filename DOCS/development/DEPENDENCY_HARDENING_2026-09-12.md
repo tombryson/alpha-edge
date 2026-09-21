@@ -41,8 +41,9 @@ all application code, the Go backend or deployed container images are secure.
 ## Build And Install Contract
 
 - npm is the release package manager; `package-lock.json` is authoritative.
-  The historical `pnpm-lock.yaml` is retained but is not maintained or used by
-  Docker/CI. Do not use it for a release install.
+  The unused historical `pnpm-lock.yaml` was removed during the 21 September
+  publication review; it described obsolete vulnerable dependencies and was
+  not used by Docker/CI. Do not add a competing lockfile.
 - `npm ci` succeeds without `--legacy-peer-deps`. `npm ls --all` exits zero
   with no invalid or missing peers. Vaul had no application imports; removing
   it does not remove the actual mobile sidebar dialogs.

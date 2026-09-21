@@ -71,3 +71,12 @@ test('rejects credentials, dumps and disguised databases without printing their 
   assert.throws(() => exportPublicSource(f.source, f.output), /Unpublishable/);
   assert.ok(!existsSync(f.output));
 });
+
+test('rejects competing package-manager lockfiles', t => {
+  const f = fixture(t);
+  for (const path of ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'frontend/bun.lockb']) {
+    f.put(path, 'Synthetic obsolete dependency graph');
+    const errors = checkFiles(f.source, [{ path, mode: '100644' }]);
+    assert.ok(errors.some(error => error.includes('use package-lock.json only')), path);
+  }
+});
